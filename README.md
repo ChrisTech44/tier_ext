@@ -14,6 +14,7 @@ lruvec, keeps the kernel's classic LRU or MGLRU behaviour.
 | Directory | Contents |
 |---|---|
 | [`design/`](design/README.md) | Design documents, written for non-experts. Start here. |
+| [`kernel-patches/`](kernel-patches/README.md) | The kernel change as patches against 7.3-rc5 |
 | `linux/` | Linux 7.3-rc5 with tier\_ext (nested git repo; `git -C linux log`) |
 | `policies/` | `tier_ext_load` loader and example policies |
 | `tests/` | VM test suite (`tests/run-vm-tests.sh`) |

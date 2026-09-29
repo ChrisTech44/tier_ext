@@ -1,0 +1,58 @@
+From 8ba8f9a83cce9514545b4674c2c66a7635360df3 Mon Sep 17 00:00:00 2001
+From: Christian Franklin <cfranklin4474@gmail.com>
+Date: Tue, 29 Sep 2026 16:08:08 -0400
+Subject: [PATCH 2/2] mm/tier_ext: look up lruvecs without NODE_DATA()
+
+Every possible node has a per-memcg lruvec from memcg creation on, but
+NODE_DATA() may be NULL for possible nodes that never came online. Use
+memcg->nodeinfo[] directly, and only fall back to the node's own lruvec
+(skipping nodes without a pglist_data) when memcg is disabled.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mm/tier_ext.c | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/mm/tier_ext.c b/mm/tier_ext.c
+index 2126fe8f1..a7043aa88 100644
+--- a/mm/tier_ext.c
++++ b/mm/tier_ext.c
+@@ -99,9 +99,16 @@ static inline void tes_inc(struct tier_ext_policy *p, enum tier_ext_stat s)
+ 	this_cpu_inc(p->stats->cnt[s]);
+ }
+ 
++/*
++ * The lruvec of (@memcg, @nid). Every possible node has a per-memcg lruvec,
++ * even before the node comes online, so policies survive memory hotplug.
++ * Without memcg only nodes with a pglist_data have one (NULL otherwise).
++ */
+ static struct lruvec *tier_ext_node_lruvec(struct mem_cgroup *memcg, int nid)
+ {
+-	return mem_cgroup_lruvec(memcg, NODE_DATA(nid));
++	if (memcg)
++		return &memcg->nodeinfo[nid]->lruvec;
++	return NODE_DATA(nid) ? &NODE_DATA(nid)->__lruvec : NULL;
+ }
+ 
+ /* ------------------------------------------------------------------------
+@@ -465,6 +472,17 @@ static int tier_ext_attach(struct tier_ext_ops *ops)
+ 		}
+ 	}
+ 
++	if (!memcg) {
++		/* memcg disabled: only nodes with a pglist_data */
++		for_each_node_mask(nid, nodes) {
++			if (tier_ext_node_lruvec(NULL, nid))
++				continue;
++			if (ops->node_mask)
++				return -EINVAL;
++			node_clear(nid, nodes);
++		}
++	}
++
+ 	p = kzalloc(sizeof(*p), GFP_KERNEL);
+ 	if (!p) {
+ 		err = -ENOMEM;
+-- 
+2.53.0
+
