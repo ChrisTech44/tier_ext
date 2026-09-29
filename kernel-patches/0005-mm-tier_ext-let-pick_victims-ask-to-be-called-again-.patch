@@ -1,0 +1,121 @@
+From 6652ac3249d9041ad58e194ddc4a23053583e13d Mon Sep 17 00:00:00 2001
+From: Christian Franklin <cfranklin4474@gmail.com>
+Date: Tue, 29 Sep 2026 19:07:00 -0400
+Subject: [PATCH 5/5] mm/tier_ext: let pick_victims ask to be called again
+ (TIER_EXT_AGAIN)
+
+A policy that rotates folios (second chances, S3-FIFO's main queue,
+MGLRU's generation moves) can spend a whole bounded batch without finding
+a victim. Falling back to the engine then reclaims by the kernel's own
+ordering, which is stale while the policy does the evicting: in an
+S3-FIFO experiment it evicted read-ahead before it was read (tens of
+thousands of refaults on a single sequential pass).
+
+TIER_EXT_AGAIN asks for another call in the same pass; it is honoured
+for at most TIER_EXT_MAX_AGAIN (16) consecutive batches without victims.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/linux/tier_ext.h | 11 ++++++++++-
+ mm/tier_ext.c            |  8 +++++++-
+ mm/vmscan.c              |  9 ++++++++-
+ 3 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/tier_ext.h b/include/linux/tier_ext.h
+index cd2721f48..154f32724 100644
+--- a/include/linux/tier_ext.h
++++ b/include/linux/tier_ext.h
+@@ -106,8 +106,17 @@ enum tier_ext_victims_ret {
+ 	 * folio_referenced). At most once per lruvec per reclaim pass.
+ 	 */
+ 	TIER_EXT_AGE		= 1U << 0,
++	/*
++	 * The policy nominated nothing (or too little) but made progress,
++	 * e.g. it rotated folios that deserve another chance: call it again
++	 * in this pass instead of falling back to the engine. Honoured for
++	 * at most TIER_EXT_MAX_AGAIN consecutive batches without victims.
++	 */
++	TIER_EXT_AGAIN		= 1U << 1,
+ };
+ 
++#define TIER_EXT_MAX_AGAIN	16
++
+ /* Passed to the per-lruvec callbacks (lruvec_shrink, swappiness). */
+ struct tier_ext_lruvec_ctx {
+ 	u64 cgroup_id;		/* cgroup v2 id of the lruvec's memcg */
+@@ -215,7 +224,7 @@ struct tier_ext_victims_ctx {
+  *	(folio_reclaim still applies). Nominated folios that are not reclaimed
+  *	are handed back through folio_added with TIER_EXT_F_RETURNED. Whatever
+  *	the policy does not cover is reclaimed by the default engine. Returns
+- *	0 or TIER_EXT_AGE.
++ *	0 or TIER_EXT_AGE and/or TIER_EXT_AGAIN.
+  * @folio_removed: The folio left this lruvec's LRU without being reclaimed
+  *	(freed: truncation, unmap, process exit ...).
+  * @folio_migrated: The folio was migrated (compaction, NUMA balancing,
+diff --git a/mm/tier_ext.c b/mm/tier_ext.c
+index fbdffd4c4..9dfd2c766 100644
+--- a/mm/tier_ext.c
++++ b/mm/tier_ext.c
+@@ -61,6 +61,7 @@ enum tier_ext_stat {
+ 	TES_VICTIM_BUSY,	/* ... ours, but isolated by someone else */
+ 	TES_VICTIM_RETURNED,	/* folios handed back unreclaimed */
+ 	TES_VICTIM_AGE,		/* TIER_EXT_AGE requests honoured */
++	TES_VICTIM_AGAIN,	/* TIER_EXT_AGAIN answers */
+ 	TES_OVERRIDDEN,		/* KEEP/SKIP ignored because priority hit 0 */
+ 	TES_INVALID,		/* callback returned an unsupported value */
+ 	NR_TIER_EXT_STATS,
+@@ -94,6 +95,7 @@ static const char * const tier_ext_stat_names[NR_TIER_EXT_STATS] = {
+ 	[TES_VICTIM_BUSY]	  = "victims_busy",
+ 	[TES_VICTIM_RETURNED]	  = "victims_returned",
+ 	[TES_VICTIM_AGE]	  = "victims_age",
++	[TES_VICTIM_AGAIN]	  = "victims_again",
+ 	[TES_OVERRIDDEN]	  = "overridden",
+ 	[TES_INVALID]		  = "invalid",
+ };
+@@ -707,10 +709,14 @@ void __tier_ext_pick_victims(struct lruvec *lruvec,
+ 
+ 	tes_inc(p, TES_VICTIM_CALLS);
+ 	ret = p->ops->pick_victims(&ctx);
+-	if (ret & ~TIER_EXT_AGE) {
++	if (ret & ~(TIER_EXT_AGE | TIER_EXT_AGAIN)) {
+ 		tes_inc(p, TES_INVALID);
+ 		ret = 0;
+ 	}
++	if (ret & TIER_EXT_AGAIN) {
++		tes_inc(p, TES_VICTIM_AGAIN);
++		v->ret |= TIER_EXT_AGAIN;
++	}
+ 	if ((ret & TIER_EXT_AGE) && (rc->victims_flags & TIER_EXT_VF_CAN_AGE)) {
+ 		tes_inc(p, TES_VICTIM_AGE);
+ 		v->ret |= TIER_EXT_AGE;
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 485ae0609..9f0e4617e 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2210,6 +2210,7 @@ static unsigned long tier_ext_reclaim_victims(struct lruvec *lruvec,
+ 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+ 	unsigned long reclaimed_total = 0;
+ 	struct tier_ext_reclaim rc;
++	unsigned int idle = 0;
+ 	bool aged = false;
+ 
+ 	nr_taken[0] = nr_taken[1] = 0;
+@@ -2288,8 +2289,14 @@ static unsigned long tier_ext_reclaim_victims(struct lruvec *lruvec,
+ 			aged = true;
+ 			just_aged = age(lruvec, sc, swappiness);
+ 		}
+-		if (!taken && !just_aged)
++		if (taken) {
++			idle = 0;
++		} else if (!just_aged &&
++			   (!(v.ret & TIER_EXT_AGAIN) ||
++			    ++idle > TIER_EXT_MAX_AGAIN)) {
++			/* nothing (valid) left: the engine takes over */
+ 			break;
++		}
+ 
+ 		budget -= min(budget, taken);
+ 		if (sc->nr_reclaimed + reclaimed_total >= sc->nr_to_reclaim)
+-- 
+2.53.0
+

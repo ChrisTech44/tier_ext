@@ -336,7 +336,9 @@ unlock:
 
 /*
  * Aging: should_run_aging() and inc_max_seq(). Returns 1 if max_seq was
- * bumped (and the kernel should walk the page tables).
+ * bumped (and the kernel should walk the page tables), 0 if aging is not
+ * needed, -1 if the oldest generation is still being moved (inc_min_seq()
+ * works in batches; the next call continues).
  */
 __noinline int age(s32 nid, int swp, int priority)
 {
@@ -365,7 +367,7 @@ __noinline int age(s32 nid, int swp, int priority)
 	ok = inc_min_seq(nid, 0, swp);
 	ok &= inc_min_seq(nid, 1, swp);
 	if (!ok)
-		return 0;	/* more to move; the next batch continues */
+		return -1;	/* more to move; the next batch continues */
 
 	te_lock(lv);
 	if (lv->x.max_seq == max_seq && nr_gens(lv, 0) < NR_GENS &&
@@ -612,16 +614,19 @@ TIER_EXT_EVENT(folio_migrated)
 TIER_EXT_OP(pick_victims, tier_ext_victims_ctx)
 {
 	struct te_lruvec *lv = te_lv(ctx->nid);
-	int swp = eff_swappiness(ctx), type, tidx, ret = 0;
+	int swp = eff_swappiness(ctx), type, tidx, ret = 0, aged;
 	u64 got;
 
 	if (!lv)
 		return 0;
 
 	/* aging first, like try_to_shrink_lruvec() */
-	if (age(ctx->nid, swp, ctx->priority)) {
+	aged = age(ctx->nid, swp, ctx->priority);
+	if (aged > 0) {
 		__sync_fetch_and_add(&nr_age_requests, 1);
 		ret = TIER_EXT_AGE;
+	} else if (aged < 0) {
+		ret = TIER_EXT_AGAIN;
 	}
 
 	/* PID decisions read the stats unlocked: they are heuristics */
@@ -632,7 +637,10 @@ TIER_EXT_OP(pick_victims, tier_ext_victims_ctx)
 	got = scan(ctx, type, tidx);
 	/* this type needs aging first: try the other one */
 	if (!got && te_may(ctx, type ^ 1))
-		scan(ctx, type ^ 1, tier_idx(lv, type ^ 1));
+		got = scan(ctx, type ^ 1, tier_idx(lv, type ^ 1));
+	/* protected folios moved up a generation: keep going */
+	if (got < ctx->nr_requested && lv->lists[LIST(type, lv->x.min_seq[type & 1])].nr)
+		ret |= TIER_EXT_AGAIN;
 	return ret;
 }
 

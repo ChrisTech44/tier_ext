@@ -98,6 +98,11 @@ struct te_init_args {
 	u64 max_pfn;	/* one past the highest pfn of the machine */
 };
 
+/*
+ * A policy that needs more arena memory (e.g. large tables) defines
+ * TE_POLICY_INIT to the name of a function "int fn(void)" that allocates it;
+ * te_init calls it after the node array exists.
+ */
 SEC("syscall")
 int te_init(struct te_init_args *args)
 {
@@ -114,7 +119,11 @@ int te_init(struct te_init_args *args)
 		return -12;	/* ENOMEM */
 	te_nodes = nodes;
 	te_max_pfn = max_pfn;
+#ifdef TE_POLICY_INIT
+	return TE_POLICY_INIT();
+#else
 	return 0;
+#endif
 }
 
 /* ------------------------------------------------------------- accessors */
@@ -350,6 +359,44 @@ static __always_inline bool te_returned(const struct tier_ext_folio_ctx *ctx)
 static __always_inline int te_type(const struct tier_ext_folio_ctx *ctx)
 {
 	return !(ctx->folio_flags & TIER_EXT_F_ANON);
+}
+
+/*
+ * Split nominations between anon (0) and file (1) the way get_scan_count()
+ * splits scanning: by the kernel's own targets when the classic engine runs
+ * (they include its IO cost model), by swappiness x size otherwise. @size
+ * are the policy's page counts per type, @picked what it nominated so far in
+ * this reclaim pass. Only returns a type that may be reclaimed and has pages.
+ */
+static __always_inline int te_pick_type(const struct tier_ext_victims_ctx *ctx,
+					u64 size_anon, u64 size_file,
+					u64 picked_anon, u64 picked_file)
+{
+	u64 w0, w1, total;
+	bool may0, may1;
+
+	may0 = (ctx->flags & TIER_EXT_VF_MAY_ANON) && size_anon;
+	may1 = (ctx->flags & TIER_EXT_VF_MAY_FILE) && size_file;
+	if (!may0)
+		return 1;
+	if (!may1)
+		return 0;
+	if (ctx->engine == TIER_EXT_ENGINE_CLASSIC &&
+	    ctx->nr_scan_anon + ctx->nr_scan_file) {
+		w0 = ctx->nr_scan_anon;
+		w1 = ctx->nr_scan_file;
+	} else {
+		u64 swp = ctx->swappiness > 200 ? 200 : ctx->swappiness;
+
+		w0 = swp * size_anon;
+		w1 = (200 - swp) * size_file;
+	}
+	if (!w0)
+		return 1;
+	if (!w1)
+		return 0;
+	total = picked_anon + picked_file;
+	return picked_file <= total * w1 / (w0 + w1);
 }
 
 /* Can pick_victims take folios of @type in this batch? */

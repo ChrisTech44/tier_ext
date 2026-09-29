@@ -554,6 +554,104 @@ t_engines() {
 	echo "$was" > /sys/kernel/mm/lru_gen/enabled
 }
 
+# Page table accesses (folio_referenced): a process keeps touching an
+# mmap'd hot file while the cgroup streams a big file and allocates cold
+# anon. lfu counts the accesses MGLRU's page table walks report and
+# protects the mapped hot folios.
+MMAP_PY='
+import mmap, sys, time
+f = open(sys.argv[1], "rb")
+m = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+end = time.time() + float(sys.argv[2])
+while time.time() < end:
+    s = 0
+    for i in range(0, len(m), 4096):
+        s += m[i]
+'
+lfu_mmap_run() { # lfu_mmap_run with|without -> LM_HOT LM_REF LM_KEEPMAP LM_PT
+	echo y > /sys/kernel/mm/lru_gen/enabled
+	cg_new te_a 256M
+	drop_caches
+	LM_REF=0 LM_KEEPMAP=0 LM_PT=0 LM_AGE=0
+	[ "$1" = with ] && { start_policy lfu.bpf.o -c $CGROOT/te_a || fail "attach lfu"; }
+	cg_run te_a python3 -c "$MMAP_PY" $DATA/hot 40 &
+	local toucher=$!
+	sleep 2
+	fill_cache te_a 0 $DATA/big
+	cg_run te_a python3 -c "$ANON_PY" 150
+	fill_cache te_a 0 $DATA/big
+	LM_HOT=$(resident $DATA/hot | awk '{ print int(($1 + $2 + $3) / 3) }')
+	if [ "$1" = with ]; then
+		LM_REF=$(dbg lfu folio_referenced)
+		stop_policy; LM_KEEPMAP=$(var "$OUT" nr_keep_mapped); LM_PT=$(var "$OUT" nr_pt_access)
+		LM_AGE=$(var "$OUT" nr_age_requests)
+	fi
+	kill $toucher 2>/dev/null; wait $toucher 2>/dev/null
+	log "lfu mmap $1: hot mapped file ${LM_HOT}% resident, folio_referenced $LM_REF, KEEP for mapped folios $LM_KEEPMAP"
+	cg_del te_a; drop_caches
+}
+
+t_lfu_mmap() {
+	local was; was=$(cat /sys/kernel/mm/lru_gen/enabled)
+	lfu_mmap_run without; local base=$LM_HOT
+	lfu_mmap_run with
+	check "lfu mmap: aging was requested on demand" gt "${LM_AGE:-0}" 0
+	check "lfu mmap: page table walks reported young folios" gt "${LM_REF:-0}" 100
+	check "lfu mmap: lfu counted page table accesses" gt "${LM_PT:-0}" 100
+	# (MGLRU's own walks keep the mapped hot folios young, so the scanner
+	# rarely presents them and KEEP verdicts are not needed here)
+	check "lfu mmap: hot mapped file at least as resident as without" \
+		test "$LM_HOT" -ge "$(( base - 5 ))"
+	echo "$was" > /sys/kernel/mm/lru_gen/enabled
+}
+
+# The cache_ext ports on a hot-file + one-pass-scan workload in a 200M
+# cgroup: every nomination valid, and each policy's signature behaviour.
+port_run() { # port_run POLICY|default -> P_HOT P_REFAULT P_SCAN P_STEAL P_ISO P_INV P_LAST
+	cg_new te_a 200M
+	drop_caches
+	P_ISO=0 P_INV=0
+	[ "$1" != default ] && { start_policy "$1.bpf.o" -c $CGROOT/te_a || { fail "attach $1"; return; }; }
+	for _ in 1 2 3 4 5 6 7 8; do fill_cache te_a 0 $DATA/hot; done
+	fill_cache te_a 0 $DATA/big
+	P_HOT=$(resident $DATA/hot | awk '{ print $1 }')
+	P_LAST=$(resident $DATA/big | awk '{ print $3 }')
+	P_REFAULT=$(awk '$1 == "workingset_refault_file" { print $2 }' $CGROOT/te_a/memory.stat)
+	P_SCAN=$(awk '$1 == "pgscan" { print $2 }' $CGROOT/te_a/memory.stat)
+	P_STEAL=$(awk '$1 == "pgsteal" { print $2 }' $CGROOT/te_a/memory.stat)
+	if [ "$1" != default ]; then
+		P_ISO=$(dbg "$1" victims_isolated); P_INV=$(dbg "$1" victims_invalid)
+		stop_policy > /dev/null
+	fi
+	log "port $1: hot ${P_HOT}% resident, big last third ${P_LAST}%, refaults $P_REFAULT, pgscan $P_SCAN pgsteal $P_STEAL, victims isolated $P_ISO invalid $P_INV"
+	cg_del te_a; drop_caches
+}
+
+t_ports() {
+	local p
+	port_run default
+	for p in fifo s3fifo sampling lhd; do
+		port_run $p
+		check "$p: victims were isolated" gt "${P_ISO:-0}" 100
+		check "$p: no invalid nominations" eq "${P_INV:-1}" 0
+		case $p in
+		fifo)
+			check "fifo: the hot file is not protected (FIFO)" lt "$P_HOT" 20
+			check "fifo: the newest data is kept" gt "$P_LAST" 80
+			check "fifo: no refaults on a single pass" lt "$P_REFAULT" 1024 ;;
+		s3fifo)
+			check "s3fifo: the hot file survives the scan (>= 90%)" test "$P_HOT" -ge 90
+			check "s3fifo: no refaults on a single pass" lt "$P_REFAULT" 1024
+			check "s3fifo: scanning is efficient (pgscan < 1.2 x pgsteal)" \
+				lt "$(( P_SCAN * 10 ))" "$(( P_STEAL * 12 ))" ;;
+		esac
+		# sampling (LFU) and lhd have no cheap signature on this
+		# workload: LFU scores unread read-ahead lowest (see the
+		# refaults), so they are smoke tests; results are logged.
+
+	done
+}
+
 # Lifecycle events: freed folios (folio_removed), migrated folios
 # (folio_migrated, followed by folio_added on the new node's lruvec).
 t_events() {
@@ -590,7 +688,7 @@ t_engine_stress() {
 	cg_run te_b timeout 70 sh -c "while :; do cat $DATA/big $DATA/a > /dev/null; done" &
 	local end=$((SECONDS + 50)) n=0 ok=1 p
 	while [ $SECONDS -lt $end ]; do
-		for p in mglru lru mru garbage; do
+		for p in mglru lru mru garbage fifo s3fifo sampling lhd; do
 			"$LOAD" -q -c $CGROOT/te_a "$HERE/$p.bpf.o" -- sleep 0.4 2>/dev/null || ok=0
 			"$LOAD" -q -c $CGROOT/te_b "$HERE/$p.bpf.o" -- sleep 0.3 2>/dev/null || ok=0
 			n=$((n + 2))
@@ -604,7 +702,7 @@ t_engine_stress() {
 
 # ------------------------------------------------------------------- main ---
 
-ALL="attach per_node attach_rules swappiness protect stream tier_demote pin lfu classic stress mru garbage engines events engine_stress"
+ALL="attach per_node attach_rules swappiness protect stream tier_demote pin lfu classic stress mru garbage engines ports lfu_mmap events engine_stress"
 setup
 for t in ${@:-$ALL}; do
 	log "=== $t"

@@ -1,7 +1,7 @@
 From c518391c00f809ddc70e8fe8f7a9b8fac11913c5 Mon Sep 17 00:00:00 2001
 From: Christian Franklin <cfranklin4474@gmail.com>
 Date: Tue, 29 Sep 2026 18:52:41 -0400
-Subject: [PATCH 4/4] mm/tier_ext: flush MGLRU walk batches after victims,
+Subject: [PATCH 4/5] mm/tier_ext: flush MGLRU walk batches after victims,
  report folios freed on putback
 
 Reclaiming nominated folios on MGLRU runs look-around, which batches

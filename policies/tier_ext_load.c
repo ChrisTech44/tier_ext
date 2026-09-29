@@ -13,7 +13,9 @@
  *
  * Engine policies (te_engine.bpf.h) contain a "te_init" syscall program; it is
  * run once after loading with the machine's highest pfn, to allocate the
- * per-pfn node array. A global variable "max_pfn" is set the same way.
+ * per-pfn node array. A global variable "max_pfn" is set the same way. A
+ * "te_periodic" syscall program, if present, runs about once a second while
+ * the policy is attached (e.g. lhd rebuilds its model there).
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -125,6 +127,15 @@ static int run_te_init(struct bpf_object *obj, unsigned long long max_pfn)
 		return opts.retval;
 	}
 	return 0;
+}
+
+/* Run the policy's te_periodic program, if it has one. */
+static void run_periodic(struct bpf_program *prog)
+{
+	LIBBPF_OPTS(bpf_test_run_opts, opts);
+
+	if (prog)
+		bpf_prog_test_run_opts(bpf_program__fd(prog), &opts);
 }
 
 /* Find a global variable in the object's .bss/.data/.rodata. */
@@ -321,6 +332,7 @@ int main(int argc, char **argv)
 	const char *cgdir = NULL, *sets[MAX_SETS], *path;
 	unsigned long long cgid = 0, mask = 0, max_pfn;
 	int nsets = 0, quiet = 0, opt, err, status = 0;
+	struct bpf_program *periodic;
 	struct bpf_object *obj;
 	struct bpf_link *links[16];
 	struct bpf_map *map;
@@ -426,6 +438,7 @@ int main(int argc, char **argv)
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 
+	periodic = bpf_object__find_program_by_name(obj, "te_periodic");
 	if (cmd) {
 		child = fork();
 		if (child == 0) {
@@ -433,12 +446,29 @@ int main(int argc, char **argv)
 			perror(cmd[0]);
 			_exit(127);
 		}
-		while (waitpid(child, &status, 0) < 0 && errno == EINTR)
-			;
+		for (i = 0;; i++) {
+			pid_t r = waitpid(child, &status, periodic ? WNOHANG : 0);
+
+			if (r == child)
+				break;
+			if (r < 0 && errno != EINTR)
+				break;
+			if (r == 0) {	/* still running: te_periodic every ~1s */
+				if (i % 20 == 0)
+					run_periodic(periodic);
+				usleep(50 * 1000);
+			}
+		}
 		status = WIFEXITED(status) ? WEXITSTATUS(status) : 128;
 	} else {
-		while (!stop)
-			pause();
+		while (!stop) {
+			if (periodic) {
+				run_periodic(periodic);
+				sleep(1);
+			} else {
+				pause();
+			}
+		}
 	}
 
 out:
