@@ -133,13 +133,24 @@ setup() {
 	[ -e $DBG ] || { echo "no $DBG"; exit 1; }
 	echo "+memory" > $CGROOT/cgroup.subtree_control
 
-	# Compressed swap so anon memory is reclaimable.
-	if ! grep -q zram0 /proc/swaps; then
+	# Swap, so anon memory is reclaimable: zram (default) or, with
+	# TE_SWAP=partition, a partition on the blank disk the host attached.
+	if [ "${TE_SWAP:-zram}" = partition ]; then
+		local disk=/dev/disk/by-id/virtio-teswap
+		[ -b $disk ] || { echo "no swap disk ($disk)"; exit 1; }
+		if ! grep -q "^$(readlink -f $disk)1 " /proc/swaps; then
+			echo 'type=swap' | sfdisk -q $disk
+			udevadm settle
+			mkswap "${disk}-part1" > /dev/null
+			swapon "${disk}-part1"
+		fi
+	elif ! grep -q zram0 /proc/swaps; then
 		modprobe zram num_devices=1
 		echo 3G > /sys/block/zram0/disksize
 		mkswap /dev/zram0 > /dev/null
 		swapon -p 100 /dev/zram0
 	fi
+	log "swap: $(tail -n +2 /proc/swaps | awk '{ printf "%s %s(%dMiB) ", $1, $2, $3 / 1024 }')"
 
 	mkdir -p $DATA
 	for f in a b c d; do
@@ -388,9 +399,12 @@ t_classic() {
 	check "classic swappiness=0: file reclaimed" gt "$FILE_DELTA" 150000
 	# MGLRU does not age anon just to satisfy a high swappiness while file
 	# is available (upstream behaviour), so this half is classic-only.
+	# swappiness=200 prefers anon; it is not "anon only". With disk swap,
+	# writeback is asynchronous, memory.reclaim overshoots its target
+	# (stock behaviour) and moves on to file once anon is exhausted.
 	swappiness_run 200 150M
 	check "classic swappiness=200: anon reclaimed" gt "$ANON_DELTA" 100000
-	check "classic swappiness=200: file untouched" lt "$FILE_DELTA" 4096
+	check "classic swappiness=200: anon preferred over file" gt "$ANON_DELTA" "$FILE_DELTA"
 	t_protect
 	t_lfu
 	echo "$was" > /sys/kernel/mm/lru_gen/enabled

@@ -6,6 +6,7 @@
 make -C linux -j$(nproc)             # kernel with CONFIG_TIER_EXT=y
 tests/run-vm-tests.sh                # build policies, boot VM, run all tests
 tests/run-vm-tests.sh swappiness pin # or selected tests
+SWAP=partition tests/run-vm-tests.sh # swap on a real disk partition instead of zram
 ```
 
 `run-vm-tests.sh` builds `policies/`, boots `linux/arch/x86/boot/bzImage` in the
@@ -16,8 +17,11 @@ ends with `RESULT: N passed, M failed`.
 
 **Topology** (`configs/hmat.conf`): node 0 has 4 CPUs and 4 GB of "DRAM" (80 ns);
 node 1 has 8 GB of CPU-less "far memory" (250 ns), which the kernel places in a
-lower memory tier. The suite sets up a 3 GB zram swap device so anon memory is
-reclaimable, and creates test cgroups under `/sys/fs/cgroup`.
+lower memory tier. The guest has no swap of its own, so the suite enables one
+(anon memory is only reclaimable with swap): by default a 3 GB zram device
+(compressed RAM), or with `SWAP=partition` a swap partition on a blank 4 GB
+virtual disk the host creates and attaches for that run only. The suite also
+creates test cgroups under `/sys/fs/cgroup`.
 
 ## What is tested
 
@@ -101,6 +105,28 @@ in a 256 MB cgroup that calls `folio_mark_accessed` and reclaim constantly):
 
 The differences are within the run-to-run spread (±5%). This is a coarse
 test; a careful micro-benchmark against an unmodified kernel is future work.
+
+## Swap on a real disk
+
+The full suite also passes (**56 of 56**) with `SWAP=partition`, i.e. swapping
+to a partition on a virtual disk instead of zram. The policy guarantees are
+unchanged: swappiness=0 reclaims 4 KiB of anon, tier_demote swaps nothing, and
+`pin` completes with ~267,000 priority-0 overrides.
+
+One difference is stock kernel behaviour, not tier_ext. Disk swap writes are
+asynchronous, and pages under writeback are not counted as reclaimed yet, so
+`memory.reclaim` overshoots its target. Without any policy attached,
+`memory.reclaim 300M` swapped out the cgroup's entire 310 MB of anon and
+dropped its whole page cache (then still reported EAGAIN). With zram, writes
+are synchronous and reclaim stops near the target. Because of this, the
+classic swappiness=200 check asserts "anon reclaimed more than file" rather
+than "file untouched": once the overshoot exhausts anon, reclaim moves on to
+file, which "prefer anon" allows.
+
+| swappiness=200, classic, reclaim 150M | anon reclaimed | file reclaimed |
+|---|---|---|
+| zram | 154,660 | 0 |
+| disk partition | 310,308 (all of it) | 151,308 |
 
 ## Bugs found by testing
 
