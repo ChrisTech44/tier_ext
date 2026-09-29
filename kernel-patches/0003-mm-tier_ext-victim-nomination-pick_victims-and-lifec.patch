@@ -1,0 +1,1230 @@
+From bf59b6f5688f6fdf4de2955d1ba15f22f91636a3 Mon Sep 17 00:00:00 2001
+From: Christian Franklin <cfranklin4474@gmail.com>
+Date: Tue, 29 Sep 2026 18:29:58 -0400
+Subject: [PATCH 3/4] mm/tier_ext: victim nomination (pick_victims) and
+ lifecycle events
+
+Let a tier_ext policy choose what to reclaim, not only judge what the
+kernel's scanner presents. Before the engine (classic LRU or MGLRU) scans
+an lruvec, pick_victims is asked for victims in batches of up to 32
+folios. The policy nominates page frame numbers with the kfunc
+bpf_tier_ext_add_victim(); the kernel trusts none of them: each pfn must
+be an online head page on this lruvec's LRU, which is then isolated and
+reclaimed through shrink_folio_list() as usual (folio_reclaim still
+applies, with TIER_EXT_RC_NOMINATED). Nominated folios that are not
+reclaimed are handed back through folio_added with TIER_EXT_F_RETURNED.
+The pages the victims consumed are taken out of the engine's scan budget;
+what the policy does not cover is reclaimed by the engine as before, and
+at priority 0 the engine always gets its full budget.
+
+A policy may return TIER_EXT_AGE to have MGLRU run its page table aging
+for the lruvec (at most once per pass).
+
+New events for policies that keep per-pfn state:
+  folio_removed     freed without reclaim (__page_cache_release)
+  folio_migrated    old pfn -> new pfn (migrate_folio_move)
+  folio_referenced  MGLRU found young PTEs (walk_update_folio)
+  folio_added       now also for THP split tails (TIER_EXT_F_SPLIT)
+and a data_key in the folio context that identifies the data (file
+offset or swap slot) independent of the page frame, including at
+eviction, for ghost lists and refault detection.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/linux/tier_ext.h | 193 ++++++++++++++++++-
+ mm/folio.c               |   1 +
+ mm/huge_memory.c         |   2 +
+ mm/migrate.c             |   2 +
+ mm/tier_ext.c            | 407 +++++++++++++++++++++++++++++++++++++--
+ mm/vmscan.c              | 256 +++++++++++++++++++++++-
+ 6 files changed, 837 insertions(+), 24 deletions(-)
+
+diff --git a/include/linux/tier_ext.h b/include/linux/tier_ext.h
+index cafd5cbb3..cd2721f48 100644
+--- a/include/linux/tier_ext.h
++++ b/include/linux/tier_ext.h
+@@ -59,6 +59,8 @@ enum tier_ext_reclaim_flags {
+ 	TIER_EXT_RC_KSWAPD	= 1U << 0,	/* background reclaim by kswapd */
+ 	TIER_EXT_RC_PROACTIVE	= 1U << 1,	/* memory.reclaim / node reclaim */
+ 	TIER_EXT_RC_CGROUP	= 1U << 2,	/* reclaim targets a memcg (limit hit) */
++	/* folio_reclaim: the folio was nominated by this policy's pick_victims */
++	TIER_EXT_RC_NOMINATED	= 1U << 3,
+ };
+ 
+ /* tier_ext_folio_ctx::folio_flags, a snapshot of the folio's state. */
+@@ -73,6 +75,37 @@ enum tier_ext_folio_flags {
+ 	TIER_EXT_F_SWAPCACHE	= 1U << 7,
+ 	TIER_EXT_F_UNEVICTABLE	= 1U << 8,
+ 	TIER_EXT_F_LARGE	= 1U << 9,	/* more than one page */
++	/*
++	 * folio_added only: the folio was nominated by pick_victims, was not
++	 * reclaimed, and is being handed back to the policy (see D21).
++	 */
++	TIER_EXT_F_RETURNED	= 1U << 10,
++	/* folio_added only: the folio was split off a large folio */
++	TIER_EXT_F_SPLIT	= 1U << 11,
++};
++
++/* tier_ext_folio_ctx::data_key: bit 63 set means "swap slot" */
++#define TIER_EXT_KEY_SWAP	(1ULL << 63)
++
++/* Victim nomination: at most this many folios per pick_victims call. */
++#define TIER_EXT_MAX_VICTIMS	32
++
++/* tier_ext_victims_ctx::flags: what the kernel accepts in this batch. */
++enum tier_ext_victims_flags {
++	TIER_EXT_VF_MAY_ANON	= 1U << 0,	/* anon folios can be reclaimed */
++	TIER_EXT_VF_MAY_FILE	= 1U << 1,	/* file folios can be reclaimed */
++	TIER_EXT_VF_MAY_UNMAP	= 1U << 2,	/* mapped folios can be reclaimed */
++	TIER_EXT_VF_CAN_AGE	= 1U << 3,	/* TIER_EXT_AGE is honoured */
++};
++
++/* Flags pick_victims may return. */
++enum tier_ext_victims_ret {
++	/*
++	 * Run the engine's aging for this lruvec after this batch (MGLRU:
++	 * a page table walk, which reports young folios via
++	 * folio_referenced). At most once per lruvec per reclaim pass.
++	 */
++	TIER_EXT_AGE		= 1U << 0,
+ };
+ 
+ /* Passed to the per-lruvec callbacks (lruvec_shrink, swappiness). */
+@@ -105,6 +138,44 @@ struct tier_ext_folio_ctx {
+ 	s32 referenced_ptes;	/* folio_reclaim: young PTEs found by rmap */
+ 	s32 priority;		/* reclaim priority, -1 outside of reclaim */
+ 	u32 reclaim_flags;	/* enum tier_ext_reclaim_flags, 0 outside reclaim */
++	/*
++	 * Identity of the data the folio holds, independent of the page frame:
++	 * the same value comes back when the same file offset or swap slot is
++	 * read in again after eviction (see D23). Page cache: hash of
++	 * (device, inode) in the upper 32 bits, file index in the lower ones.
++	 * Swap cache: TIER_EXT_KEY_SWAP | swap entry. 0 if unknown.
++	 */
++	u64 data_key;
++	u64 old_pfn;		/* folio_migrated: pfn before migration */
++	s32 old_nid;		/* folio_migrated: node before migration */
++	u32 __pad;
++};
++
++/*
++ * Passed to pick_victims. Everything is read-only except the output, which
++ * the policy fills with bpf_tier_ext_add_victim().
++ */
++struct tier_ext_victims_ctx {
++	u64 cgroup_id;
++	s32 nid;
++	s32 engine;
++	s32 priority;
++	s32 swappiness;		/* effective swappiness, 201 = anon only */
++	u32 reclaim_flags;	/* enum tier_ext_reclaim_flags */
++	u32 flags;		/* enum tier_ext_victims_flags */
++	u32 nr_requested;	/* pages the kernel would like from this batch */
++	u32 batch;		/* 0 for the first call of this reclaim pass */
++	u64 nr_to_reclaim;	/* pages the whole reclaim pass is trying to free */
++	u64 nr_reclaimed;	/* pages freed so far by this reclaim pass */
++	u64 nr_anon;		/* anon pages on this lruvec's LRU lists */
++	u64 nr_file;		/* file pages on this lruvec's LRU lists */
++	/* the kernel's own anon/file split of this pass's scan budget */
++	u64 nr_scan_anon;
++	u64 nr_scan_file;
++	/* output */
++	u32 nr;			/* entries used in pfns[] */
++	u32 __pad;
++	u64 pfns[TIER_EXT_MAX_VICTIMS];
+ };
+ 
+ /**
+@@ -137,6 +208,23 @@ struct tier_ext_folio_ctx {
+  *	through @folio_reclaim and the MGLRU generation.
+  * @folio_evicted: Reclaim freed the folio (it is leaving memory). Demoted
+  *	folios are not reported here; they are added to their new lruvec.
++ * @pick_victims: Reclaim wants up to ctx->nr_requested pages from this
++ *	lruvec. The policy nominates folios by pfn with
++ *	bpf_tier_ext_add_victim(). The kernel re-validates every pfn, isolates
++ *	the folios that still belong to this lruvec and reclaims them
++ *	(folio_reclaim still applies). Nominated folios that are not reclaimed
++ *	are handed back through folio_added with TIER_EXT_F_RETURNED. Whatever
++ *	the policy does not cover is reclaimed by the default engine. Returns
++ *	0 or TIER_EXT_AGE.
++ * @folio_removed: The folio left this lruvec's LRU without being reclaimed
++ *	(freed: truncation, unmap, process exit ...).
++ * @folio_migrated: The folio was migrated (compaction, NUMA balancing,
++ *	demotion, promotion). ctx describes the new folio; ctx->old_pfn and
++ *	ctx->old_nid the old one. Delivered to the policy of the old lruvec.
++ *	The new folio is also reported to its lruvec through folio_added.
++ * @folio_referenced: MGLRU found the folio's page table entries young
++ *	(page table walk during aging, or look-around during eviction), i.e.
++ *	it was accessed through a mapping since the last check.
+  * @cgroup_id: cgroup v2 id (inode number of the cgroup directory) whose
+  *	memcg's lruvecs this policy controls; 0 means the root cgroup.
+  * @node_mask: bitmask of NUMA nodes (bit n = node n) whose lruvecs this
+@@ -152,6 +240,10 @@ struct tier_ext_ops {
+ 	void (*folio_added)(struct tier_ext_folio_ctx *ctx);
+ 	void (*folio_accessed)(struct tier_ext_folio_ctx *ctx);
+ 	void (*folio_evicted)(struct tier_ext_folio_ctx *ctx);
++	s32 (*pick_victims)(struct tier_ext_victims_ctx *ctx);
++	void (*folio_removed)(struct tier_ext_folio_ctx *ctx);
++	void (*folio_migrated)(struct tier_ext_folio_ctx *ctx);
++	void (*folio_referenced)(struct tier_ext_folio_ctx *ctx);
+ 
+ 	u64 cgroup_id;
+ 	u64 node_mask;
+@@ -177,6 +269,22 @@ struct tier_ext_reclaim {
+ 	unsigned int flags;
+ 	unsigned long nr_to_reclaim;
+ 	unsigned long nr_reclaimed;
++	/* victim nomination only */
++	int swappiness;
++	int reclaim_idx;		/* highest zone reclaim may take from */
++	unsigned int victims_flags;	/* enum tier_ext_victims_flags */
++	unsigned int batch;
++	unsigned long nr_requested;
++	unsigned long nr_scan_anon;
++	unsigned long nr_scan_file;
++};
++
++/* Result of one pick_victims call, see __tier_ext_pick_victims(). */
++struct tier_ext_victims {
++	struct list_head list;		/* isolated folios */
++	unsigned long nr_taken[2];	/* pages isolated: [0] anon, [1] file */
++	unsigned int ret;		/* policy's return flags */
++	unsigned int nr_returned;	/* folios handed back unreclaimed */
+ };
+ 
+ bool __tier_ext_lruvec_skip(struct lruvec *lruvec,
+@@ -189,15 +297,63 @@ unsigned int __tier_ext_folio_reclaim(struct lruvec *lruvec,
+ 				      struct folio *folio,
+ 				      const struct tier_ext_reclaim *rc,
+ 				      int referenced_ptes);
+-void __tier_ext_folio_added(struct lruvec *lruvec, struct folio *folio);
++void __tier_ext_folio_added(struct lruvec *lruvec, struct folio *folio,
++			    u32 extra_flags);
+ void __tier_ext_folio_accessed(struct folio *folio);
+-void __tier_ext_folio_evicted(struct folio *folio);
++void __tier_ext_folio_evicted(struct folio *folio, u64 data_key);
++bool __tier_ext_has_victims(struct lruvec *lruvec);
++void __tier_ext_pick_victims(struct lruvec *lruvec,
++			     const struct tier_ext_reclaim *rc,
++			     struct tier_ext_victims *v);
++void __tier_ext_folio_returned(struct lruvec *lruvec, struct folio *folio);
++void __tier_ext_folio_removed(struct lruvec *lruvec, struct folio *folio);
++void __tier_ext_folio_migrated(struct folio *src, struct folio *dst);
++void __tier_ext_folio_referenced(struct folio *folio);
++u64 tier_ext_data_key(struct folio *folio);
+ 
+ static __always_inline void tier_ext_folio_added(struct lruvec *lruvec,
+ 						 struct folio *folio)
+ {
+ 	if (tier_ext_lruvec(lruvec))
+-		__tier_ext_folio_added(lruvec, folio);
++		__tier_ext_folio_added(lruvec, folio, 0);
++}
++
++/* @new_folio was split off a large folio and put on @lruvec's LRU. */
++static __always_inline void tier_ext_folio_split(struct lruvec *lruvec,
++						 struct folio *new_folio)
++{
++	if (tier_ext_lruvec(lruvec))
++		__tier_ext_folio_added(lruvec, new_folio, TIER_EXT_F_SPLIT);
++}
++
++/* Called with the lruvec's LRU lock held, @folio was just taken off it. */
++static __always_inline void tier_ext_folio_removed(struct lruvec *lruvec,
++						   struct folio *folio)
++{
++	if (tier_ext_lruvec(lruvec))
++		__tier_ext_folio_removed(lruvec, folio);
++}
++
++/* @src was migrated to @dst; called before @dst is added to an LRU. */
++static __always_inline void tier_ext_folio_migrated(struct folio *src,
++						    struct folio *dst)
++{
++	if (static_branch_unlikely(&tier_ext_attached))
++		__tier_ext_folio_migrated(src, dst);
++}
++
++static __always_inline void tier_ext_folio_referenced(struct folio *folio)
++{
++	if (static_branch_unlikely(&tier_ext_attached))
++		__tier_ext_folio_referenced(folio);
++}
++
++/* data_key of a folio about to leave memory, 0 when nobody listens */
++static __always_inline u64 tier_ext_eviction_key(struct folio *folio)
++{
++	if (static_branch_unlikely(&tier_ext_attached))
++		return tier_ext_data_key(folio);
++	return 0;
+ }
+ 
+ static __always_inline void tier_ext_folio_accessed(struct folio *folio)
+@@ -206,10 +362,11 @@ static __always_inline void tier_ext_folio_accessed(struct folio *folio)
+ 		__tier_ext_folio_accessed(folio);
+ }
+ 
+-static __always_inline void tier_ext_folio_evicted(struct folio *folio)
++static __always_inline void tier_ext_folio_evicted(struct folio *folio,
++						   u64 data_key)
+ {
+ 	if (static_branch_unlikely(&tier_ext_attached))
+-		__tier_ext_folio_evicted(folio);
++		__tier_ext_folio_evicted(folio, data_key);
+ }
+ 
+ #else /* !CONFIG_TIER_EXT */
+@@ -228,8 +385,32 @@ static inline void tier_ext_folio_accessed(struct folio *folio)
+ {
+ }
+ 
+-static inline void tier_ext_folio_evicted(struct folio *folio)
++static inline void tier_ext_folio_evicted(struct folio *folio, u64 data_key)
++{
++}
++
++static inline void tier_ext_folio_split(struct lruvec *lruvec,
++					struct folio *new_folio)
++{
++}
++
++static inline void tier_ext_folio_removed(struct lruvec *lruvec,
++					  struct folio *folio)
++{
++}
++
++static inline void tier_ext_folio_migrated(struct folio *src,
++					   struct folio *dst)
++{
++}
++
++static inline void tier_ext_folio_referenced(struct folio *folio)
++{
++}
++
++static inline u64 tier_ext_eviction_key(struct folio *folio)
+ {
++	return 0;
+ }
+ 
+ #endif /* CONFIG_TIER_EXT */
+diff --git a/mm/folio.c b/mm/folio.c
+index 51d6336b0..645a1b54b 100644
+--- a/mm/folio.c
++++ b/mm/folio.c
+@@ -72,6 +72,7 @@ static void __page_cache_release(struct folio *folio, struct lruvec **lruvecp,
+ 	if (folio_test_lru(folio)) {
+ 		folio_lruvec_relock_irqsave(folio, lruvecp, flagsp);
+ 		lruvec_del_folio(*lruvecp, folio);
++		tier_ext_folio_removed(*lruvecp, folio);
+ 		__folio_clear_lru_flags(folio);
+ 	}
+ }
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 1e5d68acf..4e83c5019 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -37,6 +37,7 @@
+ #include <linux/page_owner.h>
+ #include <linux/sched/sysctl.h>
+ #include <linux/memory-tiers.h>
++#include <linux/tier_ext.h>
+ #include <linux/compat.h>
+ #include <linux/pgalloc.h>
+ #include <linux/pgalloc_tag.h>
+@@ -3667,6 +3668,7 @@ static void lru_add_split_folio(struct folio *folio, struct folio *new_folio,
+ 		else
+ 			list_add_tail(&new_folio->lru, &folio->lru);
+ 		folio_set_lru(new_folio);
++		tier_ext_folio_split(lruvec, new_folio);
+ 	}
+ }
+ 
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 15b45832b..0f00e84f4 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -42,6 +42,7 @@
+ #include <linux/memory.h>
+ #include <linux/sched/sysctl.h>
+ #include <linux/memory-tiers.h>
++#include <linux/tier_ext.h>
+ #include <linux/pagewalk.h>
+ 
+ #include <asm/tlbflush.h>
+@@ -1411,6 +1412,7 @@ static int migrate_folio_move(free_folio_t put_new_folio, unsigned long private,
+ 	 * unsuccessful, and other cases when a page has been temporarily
+ 	 * isolated from the unevictable LRU: but this case is the easiest.
+ 	 */
++	tier_ext_folio_migrated(src, dst);
+ 	folio_add_lru(dst);
+ 	if (old_folio_state & FOLIO_WAS_MLOCKED)
+ 		lru_add_drain();
+diff --git a/mm/tier_ext.c b/mm/tier_ext.c
+index a7043aa88..fbdffd4c4 100644
+--- a/mm/tier_ext.c
++++ b/mm/tier_ext.c
+@@ -19,6 +19,7 @@
+ #include <linux/btf.h>
+ #include <linux/btf_ids.h>
+ #include <linux/debugfs.h>
++#include <linux/hash.h>
+ #include <linux/memcontrol.h>
+ #include <linux/mm_inline.h>
+ #include <linux/nodemask.h>
+@@ -48,6 +49,18 @@ enum tier_ext_stat {
+ 	TES_ADDED,
+ 	TES_ACCESSED,
+ 	TES_EVICTED,
++	TES_REMOVED,
++	TES_MIGRATED,
++	TES_REFERENCED,
++	TES_VICTIM_CALLS,
++	TES_VICTIM_NOMINATED,	/* pfns handed to the kernel */
++	TES_VICTIM_ISOLATED,	/* ... isolated for reclaim */
++	TES_VICTIM_INVALID,	/* ... not an LRU folio (free, kernel, tail, ...) */
++	TES_VICTIM_FOREIGN,	/* ... an LRU folio of another lruvec */
++	TES_VICTIM_SKIPPED,	/* ... ours, but not reclaimable in this pass */
++	TES_VICTIM_BUSY,	/* ... ours, but isolated by someone else */
++	TES_VICTIM_RETURNED,	/* folios handed back unreclaimed */
++	TES_VICTIM_AGE,		/* TIER_EXT_AGE requests honoured */
+ 	TES_OVERRIDDEN,		/* KEEP/SKIP ignored because priority hit 0 */
+ 	TES_INVALID,		/* callback returned an unsupported value */
+ 	NR_TIER_EXT_STATS,
+@@ -69,6 +82,18 @@ static const char * const tier_ext_stat_names[NR_TIER_EXT_STATS] = {
+ 	[TES_ADDED]		  = "folio_added",
+ 	[TES_ACCESSED]		  = "folio_accessed",
+ 	[TES_EVICTED]		  = "folio_evicted",
++	[TES_REMOVED]		  = "folio_removed",
++	[TES_MIGRATED]		  = "folio_migrated",
++	[TES_REFERENCED]	  = "folio_referenced",
++	[TES_VICTIM_CALLS]	  = "victims_calls",
++	[TES_VICTIM_NOMINATED]	  = "victims_nominated",
++	[TES_VICTIM_ISOLATED]	  = "victims_isolated",
++	[TES_VICTIM_INVALID]	  = "victims_invalid",
++	[TES_VICTIM_FOREIGN]	  = "victims_foreign",
++	[TES_VICTIM_SKIPPED]	  = "victims_skipped",
++	[TES_VICTIM_BUSY]	  = "victims_busy",
++	[TES_VICTIM_RETURNED]	  = "victims_returned",
++	[TES_VICTIM_AGE]	  = "victims_age",
+ 	[TES_OVERRIDDEN]	  = "overridden",
+ 	[TES_INVALID]		  = "invalid",
+ };
+@@ -99,6 +124,12 @@ static inline void tes_inc(struct tier_ext_policy *p, enum tier_ext_stat s)
+ 	this_cpu_inc(p->stats->cnt[s]);
+ }
+ 
++static inline void tes_add(struct tier_ext_policy *p, enum tier_ext_stat s,
++			   u64 n)
++{
++	this_cpu_add(p->stats->cnt[s], n);
++}
++
+ /*
+  * The lruvec of (@memcg, @nid). Every possible node has a per-memcg lruvec,
+  * even before the node comes online, so policies survive memory hotplug.
+@@ -116,6 +147,31 @@ static struct lruvec *tier_ext_node_lruvec(struct mem_cgroup *memcg, int nid)
+  * ------------------------------------------------------------------------
+  */
+ 
++/*
++ * Identity of the data in @folio, independent of the page frame, so that a
++ * policy can recognise data that comes back after eviction (ghost entries,
++ * refault detection). See D23. Racy by nature: the result is a hint.
++ * Callers hold rcu_read_lock() or the folio lock (inodes are RCU-freed).
++ */
++u64 tier_ext_data_key(struct folio *folio)
++{
++	struct address_space *mapping;
++	struct inode *host;
++	u64 id;
++
++	if (folio_test_swapcache(folio))
++		return TIER_EXT_KEY_SWAP | folio->swap.val;
++
++	mapping = READ_ONCE(folio->mapping);
++	if (!mapping || ((unsigned long)mapping & FOLIO_MAPPING_FLAGS))
++		return 0;
++	host = READ_ONCE(mapping->host);
++	if (!host)
++		return 0;
++	id = hash_64(host->i_ino ^ ((u64)host->i_sb->s_dev << 32), 31);
++	return (id << 32) | (u32)folio->index;
++}
++
+ static void tier_ext_fill_folio_ctx(struct tier_ext_folio_ctx *ctx,
+ 				    struct tier_ext_policy *p,
+ 				    struct folio *folio,
+@@ -159,6 +215,10 @@ static void tier_ext_fill_folio_ctx(struct tier_ext_folio_ctx *ctx,
+ #endif
+ 	ctx->lru = -1;
+ 	ctx->referenced_ptes = 0;
++	ctx->data_key = tier_ext_data_key(folio);
++	ctx->old_pfn = 0;
++	ctx->old_nid = NUMA_NO_NODE;
++	ctx->__pad = 0;
+ 	if (rc) {
+ 		ctx->engine = rc->engine;
+ 		ctx->priority = rc->priority;
+@@ -361,18 +421,63 @@ out:
+ 	return ret;
+ }
+ 
+-void __tier_ext_folio_added(struct lruvec *lruvec, struct folio *folio)
++/*
++ * Deliver a folio event to @p. Events cannot be refused, so there is nothing
++ * to sanitize. Must be called under rcu_read_lock().
++ */
++static void tier_ext_event(struct tier_ext_policy *p,
++			   void (*op)(struct tier_ext_folio_ctx *),
++			   enum tier_ext_stat stat, struct folio *folio,
++			   u32 extra_flags)
+ {
+ 	struct tier_ext_folio_ctx ctx;
++
++	if (!op)
++		return;
++	tier_ext_fill_folio_ctx(&ctx, p, folio, NULL);
++	ctx.folio_flags |= extra_flags;
++	tes_inc(p, stat);
++	op(&ctx);
++}
++
++void __tier_ext_folio_added(struct lruvec *lruvec, struct folio *folio,
++			    u32 extra_flags)
++{
+ 	struct tier_ext_policy *p;
+ 
+ 	rcu_read_lock();
+ 	p = rcu_dereference(lruvec->tier_ext);
+-	if (p && p->ops->folio_added) {
+-		tier_ext_fill_folio_ctx(&ctx, p, folio, NULL);
+-		tes_inc(p, TES_ADDED);
+-		p->ops->folio_added(&ctx);
+-	}
++	if (p)
++		tier_ext_event(p, p->ops->folio_added, TES_ADDED, folio,
++			       extra_flags);
++	rcu_read_unlock();
++}
++
++/*
++ * A folio this lruvec's policy nominated was not reclaimed: hand it back
++ * (D21). @folio is isolated, so its lruvec is stable.
++ */
++void __tier_ext_folio_returned(struct lruvec *lruvec, struct folio *folio)
++{
++	struct tier_ext_policy *p;
++
++	rcu_read_lock();
++	p = rcu_dereference(lruvec->tier_ext);
++	if (p)
++		tier_ext_event(p, p->ops->folio_added, TES_VICTIM_RETURNED,
++			       folio, TIER_EXT_F_RETURNED);
++	rcu_read_unlock();
++}
++
++/* Called with @lruvec's LRU lock held; @folio is being freed. */
++void __tier_ext_folio_removed(struct lruvec *lruvec, struct folio *folio)
++{
++	struct tier_ext_policy *p;
++
++	rcu_read_lock();
++	p = rcu_dereference(lruvec->tier_ext);
++	if (p)
++		tier_ext_event(p, p->ops->folio_removed, TES_REMOVED, folio, 0);
+ 	rcu_read_unlock();
+ }
+ 
+@@ -388,20 +493,20 @@ static struct tier_ext_policy *tier_ext_folio_policy(struct folio *folio)
+ 
+ void __tier_ext_folio_accessed(struct folio *folio)
+ {
+-	struct tier_ext_folio_ctx ctx;
+ 	struct tier_ext_policy *p;
+ 
+ 	rcu_read_lock();
+ 	p = tier_ext_folio_policy(folio);
+-	if (p && p->ops->folio_accessed) {
+-		tier_ext_fill_folio_ctx(&ctx, p, folio, NULL);
+-		tes_inc(p, TES_ACCESSED);
+-		p->ops->folio_accessed(&ctx);
+-	}
++	if (p)
++		tier_ext_event(p, p->ops->folio_accessed, TES_ACCESSED, folio, 0);
+ 	rcu_read_unlock();
+ }
+ 
+-void __tier_ext_folio_evicted(struct folio *folio)
++/*
++ * @data_key was taken before the folio left the page/swap cache, when its
++ * identity was still known (see tier_ext_eviction_key()).
++ */
++void __tier_ext_folio_evicted(struct folio *folio, u64 data_key)
+ {
+ 	struct tier_ext_folio_ctx ctx;
+ 	struct tier_ext_policy *p;
+@@ -410,12 +515,216 @@ void __tier_ext_folio_evicted(struct folio *folio)
+ 	p = tier_ext_folio_policy(folio);
+ 	if (p && p->ops->folio_evicted) {
+ 		tier_ext_fill_folio_ctx(&ctx, p, folio, NULL);
++		ctx.data_key = data_key;
+ 		tes_inc(p, TES_EVICTED);
+ 		p->ops->folio_evicted(&ctx);
+ 	}
+ 	rcu_read_unlock();
+ }
+ 
++/* Page table walk / look-around found @folio young. */
++void __tier_ext_folio_referenced(struct folio *folio)
++{
++	struct tier_ext_policy *p;
++
++	rcu_read_lock();
++	p = tier_ext_folio_policy(folio);
++	if (p)
++		tier_ext_event(p, p->ops->folio_referenced, TES_REFERENCED,
++			       folio, 0);
++	rcu_read_unlock();
++}
++
++/*
++ * @src was migrated to @dst, which now holds the memcg charge. Tell the
++ * policy of @src's lruvec, so it can forget (or move) the old pfn.
++ */
++void __tier_ext_folio_migrated(struct folio *src, struct folio *dst)
++{
++	struct tier_ext_folio_ctx ctx;
++	struct tier_ext_policy *p;
++	struct mem_cgroup *memcg;
++
++	rcu_read_lock();
++	memcg = folio_memcg(dst);
++	if (!memcg && !mem_cgroup_disabled())
++		goto out;
++	p = rcu_dereference(mem_cgroup_lruvec(memcg, folio_pgdat(src))->tier_ext);
++	if (!p || !p->ops->folio_migrated)
++		goto out;
++	tier_ext_fill_folio_ctx(&ctx, p, dst, NULL);
++	ctx.old_pfn = folio_pfn(src);
++	ctx.old_nid = folio_nid(src);
++	tes_inc(p, TES_MIGRATED);
++	p->ops->folio_migrated(&ctx);
++out:
++	rcu_read_unlock();
++}
++
++/* ------------------------------------------------------------------------
++ * Victim nomination (D19-D22)
++ * ------------------------------------------------------------------------
++ */
++
++bool __tier_ext_has_victims(struct lruvec *lruvec)
++{
++	struct tier_ext_policy *p;
++	bool ret;
++
++	rcu_read_lock();
++	p = rcu_dereference(lruvec->tier_ext);
++	ret = p && p->ops->pick_victims;
++	rcu_read_unlock();
++	return ret;
++}
++
++/*
++ * Turn one nominated pfn into an isolated folio of @lruvec, or explain why
++ * not. Nothing about @pfn is trusted: it may be garbage, a free page, a tail
++ * page, a kernel page or another cgroup's folio. Only a head page we can
++ * take a reference on, that is on @lruvec's LRU, is isolated.
++ *
++ * Called under rcu_read_lock() with interrupts enabled (folio_isolate_lru()
++ * takes the LRU lock itself).
++ */
++static enum tier_ext_stat tier_ext_isolate_victim(struct tier_ext_policy *p,
++						  struct lruvec *lruvec,
++						  u64 pfn,
++						  const struct tier_ext_reclaim *rc,
++						  struct tier_ext_victims *v)
++{
++	enum tier_ext_stat res;
++	struct folio *folio;
++	struct page *page;
++	bool file;
++
++	if (pfn != (unsigned long)pfn)
++		return TES_VICTIM_INVALID;
++	page = pfn_to_online_page(pfn);
++	if (!page)
++		return TES_VICTIM_INVALID;
++	/* fails for free pages and tail pages; a head page stays a head */
++	folio = folio_get_nontail_page(page);
++	if (!folio)
++		return TES_VICTIM_INVALID;
++
++	/*
++	 * Only LRU folios are known to carry a memcg in the usual format,
++	 * so test that before looking at the lruvec. A folio of ours that is
++	 * off the LRU right now comes back through folio_added when it is
++	 * put back.
++	 */
++	if (!folio_test_lru(folio)) {
++		res = TES_VICTIM_INVALID;
++		goto put;
++	}
++	if (folio_lruvec(folio) != lruvec) {
++		res = TES_VICTIM_FOREIGN;
++		goto put;
++	}
++
++	file = folio_is_file_lru(folio);
++	if (folio_test_unevictable(folio) ||
++	    folio_zonenum(folio) > rc->reclaim_idx ||
++	    !(rc->victims_flags & (file ? TIER_EXT_VF_MAY_FILE :
++					  TIER_EXT_VF_MAY_ANON)) ||
++	    (!(rc->victims_flags & TIER_EXT_VF_MAY_UNMAP) &&
++	     folio_mapped(folio))) {
++		/* still the policy's: hand it back */
++		tier_ext_event(p, p->ops->folio_added, TES_VICTIM_RETURNED,
++			       folio, TIER_EXT_F_RETURNED);
++		v->nr_returned++;
++		res = TES_VICTIM_SKIPPED;
++		goto put;
++	}
++
++	/* takes its own reference and handles both engines' accounting */
++	if (!folio_isolate_lru(folio)) {
++		res = TES_VICTIM_BUSY;
++		goto put;
++	}
++	/* an isolated folio keeps its memcg, but be paranoid */
++	if (WARN_ON_ONCE(folio_lruvec(folio) != lruvec)) {
++		folio_putback_lru(folio);
++		res = TES_VICTIM_FOREIGN;
++		goto put;
++	}
++	/* shrink_folio_list() expects inactive folios, like reclaim_pages() */
++	folio_clear_active(folio);
++	node_stat_mod_folio(folio, NR_ISOLATED_ANON + file,
++			    folio_nr_pages(folio));
++	v->nr_taken[file] += folio_nr_pages(folio);
++	/* list_add(): shrink_folio_list() takes from the tail, keep the order */
++	list_add(&folio->lru, &v->list);
++	res = TES_VICTIM_ISOLATED;
++put:
++	folio_put(folio);
++	return res;
++}
++
++/*
++ * Ask @lruvec's policy for victims and isolate the valid ones onto
++ * @v->list. The caller reclaims them, hands survivors back with
++ * __tier_ext_folio_returned() and puts them back on the LRU.
++ */
++void __tier_ext_pick_victims(struct lruvec *lruvec,
++			     const struct tier_ext_reclaim *rc,
++			     struct tier_ext_victims *v)
++{
++	struct tier_ext_victims_ctx ctx;
++	struct tier_ext_policy *p;
++	u32 i, nr;
++	s32 ret;
++
++	INIT_LIST_HEAD(&v->list);
++	v->nr_taken[0] = v->nr_taken[1] = 0;
++	v->ret = 0;
++	v->nr_returned = 0;
++
++	rcu_read_lock();
++	p = rcu_dereference(lruvec->tier_ext);
++	if (!p || !p->ops->pick_victims)
++		goto out;
++
++	memset(&ctx, 0, sizeof(ctx));
++	ctx.cgroup_id = p->cgroup_id;
++	ctx.nid = lruvec_pgdat(lruvec)->node_id;
++	ctx.engine = rc->engine;
++	ctx.priority = rc->priority;
++	ctx.swappiness = rc->swappiness;
++	ctx.reclaim_flags = rc->flags;
++	ctx.flags = rc->victims_flags;
++	ctx.nr_requested = min_t(unsigned long, rc->nr_requested, U32_MAX);
++	ctx.batch = rc->batch;
++	ctx.nr_to_reclaim = rc->nr_to_reclaim;
++	ctx.nr_reclaimed = rc->nr_reclaimed;
++	ctx.nr_anon = lruvec_page_state(lruvec, NR_INACTIVE_ANON) +
++		      lruvec_page_state(lruvec, NR_ACTIVE_ANON);
++	ctx.nr_file = lruvec_page_state(lruvec, NR_INACTIVE_FILE) +
++		      lruvec_page_state(lruvec, NR_ACTIVE_FILE);
++	ctx.nr_scan_anon = rc->nr_scan_anon;
++	ctx.nr_scan_file = rc->nr_scan_file;
++
++	tes_inc(p, TES_VICTIM_CALLS);
++	ret = p->ops->pick_victims(&ctx);
++	if (ret & ~TIER_EXT_AGE) {
++		tes_inc(p, TES_INVALID);
++		ret = 0;
++	}
++	if ((ret & TIER_EXT_AGE) && (rc->victims_flags & TIER_EXT_VF_CAN_AGE)) {
++		tes_inc(p, TES_VICTIM_AGE);
++		v->ret |= TIER_EXT_AGE;
++	}
++
++	/* bpf_tier_ext_add_victim() keeps nr in bounds; don't rely on it */
++	nr = min_t(u32, ctx.nr, TIER_EXT_MAX_VICTIMS);
++	tes_add(p, TES_VICTIM_NOMINATED, nr);
++	for (i = 0; i < nr; i++)
++		tes_inc(p, tier_ext_isolate_victim(p, lruvec, ctx.pfns[i], rc, v));
++out:
++	rcu_read_unlock();
++}
++
+ /* ------------------------------------------------------------------------
+  * Attach / detach
+  * ------------------------------------------------------------------------
+@@ -591,6 +900,8 @@ static int tier_ext_ops_init(struct btf *btf)
+ 	BTF_TYPE_EMIT_ENUM(TIER_EXT_ENGINE_CLASSIC);
+ 	BTF_TYPE_EMIT_ENUM(TIER_EXT_RC_KSWAPD);
+ 	BTF_TYPE_EMIT_ENUM(TIER_EXT_F_ANON);
++	BTF_TYPE_EMIT_ENUM(TIER_EXT_VF_MAY_ANON);
++	BTF_TYPE_EMIT_ENUM(TIER_EXT_AGE);
+ 	return 0;
+ }
+ 
+@@ -633,6 +944,64 @@ static int tier_ext_ops_check_member(const struct btf_type *t,
+ 	return 0;
+ }
+ 
++/* ------------------------------------------------------------------------
++ * kfuncs
++ * ------------------------------------------------------------------------
++ */
++
++__bpf_kfunc_start_defs();
++
++/**
++ * bpf_tier_ext_add_victim - nominate a folio from pick_victims
++ * @ctx: the pick_victims context
++ * @pfn: pfn of the folio's first page
++ *
++ * Returns 0, or -ENOSPC once TIER_EXT_MAX_VICTIMS pfns were added. May be
++ * called with a bpf_spin_lock held.
++ */
++__bpf_kfunc int bpf_tier_ext_add_victim(struct tier_ext_victims_ctx *ctx,
++					u64 pfn)
++{
++	u32 nr = ctx->nr;
++
++	if (nr >= TIER_EXT_MAX_VICTIMS)
++		return -ENOSPC;
++	ctx->pfns[nr] = pfn;
++	ctx->nr = nr + 1;
++	return 0;
++}
++
++__bpf_kfunc_end_defs();
++
++BTF_KFUNCS_START(tier_ext_kfunc_ids)
++BTF_ID_FLAGS(func, bpf_tier_ext_add_victim, KF_SPINLOCK_SAFE)
++BTF_KFUNCS_END(tier_ext_kfunc_ids)
++
++static struct bpf_struct_ops bpf_tier_ext_ops;
++
++/* Only a tier_ext pick_victims program may nominate victims. */
++static int tier_ext_kfunc_filter(const struct bpf_prog *prog, u32 kfunc_id)
++{
++	if (!btf_id_set8_contains(&tier_ext_kfunc_ids, kfunc_id))
++		return 0;
++	if (prog->type != BPF_PROG_TYPE_STRUCT_OPS)
++		return -EACCES;
++	/* the verifier re-runs the filter once st_ops is known */
++	if (!prog->aux->st_ops)
++		return 0;
++	if (prog->aux->st_ops != &bpf_tier_ext_ops ||
++	    prog->aux->attach_st_ops_member_off !=
++	    offsetof(struct tier_ext_ops, pick_victims))
++		return -EACCES;
++	return 0;
++}
++
++static const struct btf_kfunc_id_set tier_ext_kfunc_set = {
++	.owner	= THIS_MODULE,
++	.set	= &tier_ext_kfunc_ids,
++	.filter	= tier_ext_kfunc_filter,
++};
++
+ static bool tier_ext_ops_is_valid_access(int off, int size,
+ 					 enum bpf_access_type type,
+ 					 const struct bpf_prog *prog,
+@@ -659,6 +1028,7 @@ static const struct bpf_verifier_ops tier_ext_verifier_ops = {
+ static s32 tier_ext_stub_lruvec(struct tier_ext_lruvec_ctx *ctx) { return 0; }
+ static s32 tier_ext_stub_folio(struct tier_ext_folio_ctx *ctx) { return 0; }
+ static void tier_ext_stub_event(struct tier_ext_folio_ctx *ctx) {}
++static s32 tier_ext_stub_victims(struct tier_ext_victims_ctx *ctx) { return 0; }
+ 
+ static struct tier_ext_ops __bpf_ops_tier_ext_ops = {
+ 	.lruvec_shrink	= tier_ext_stub_lruvec,
+@@ -668,6 +1038,10 @@ static struct tier_ext_ops __bpf_ops_tier_ext_ops = {
+ 	.folio_added	= tier_ext_stub_event,
+ 	.folio_accessed	= tier_ext_stub_event,
+ 	.folio_evicted	= tier_ext_stub_event,
++	.pick_victims	= tier_ext_stub_victims,
++	.folio_removed	= tier_ext_stub_event,
++	.folio_migrated	= tier_ext_stub_event,
++	.folio_referenced = tier_ext_stub_event,
+ };
+ 
+ static struct bpf_struct_ops bpf_tier_ext_ops = {
+@@ -718,6 +1092,13 @@ static int __init tier_ext_init(void)
+ {
+ 	int err;
+ 
++	err = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS,
++					&tier_ext_kfunc_set);
++	if (err) {
++		pr_warn("tier_ext: failed to register kfuncs: %d\n", err);
++		return err;
++	}
++
+ 	err = register_bpf_struct_ops(&bpf_tier_ext_ops, tier_ext_ops);
+ 	if (err) {
+ 		pr_warn("tier_ext: failed to register struct_ops: %d\n", err);
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index aa4dcbeff..947a4961e 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -152,6 +152,11 @@ struct scan_control {
+ 	/* Always discard instead of demoting to lower tier memory */
+ 	unsigned int no_demotion:1;
+ 
++#ifdef CONFIG_TIER_EXT
++	/* shrink_folio_list() is reclaiming folios a tier_ext policy chose */
++	unsigned int tier_ext_nominated:1;
++#endif
++
+ 	/* Allocation order */
+ 	s8 order;
+ 
+@@ -283,7 +288,8 @@ static void tier_ext_rc(struct tier_ext_reclaim *rc, struct scan_control *sc,
+ 	rc->priority = sc->priority;
+ 	rc->flags = (current_is_kswapd() ? TIER_EXT_RC_KSWAPD : 0) |
+ 		    (sc->proactive ? TIER_EXT_RC_PROACTIVE : 0) |
+-		    (cgroup_reclaim(sc) ? TIER_EXT_RC_CGROUP : 0);
++		    (cgroup_reclaim(sc) ? TIER_EXT_RC_CGROUP : 0) |
++		    (sc->tier_ext_nominated ? TIER_EXT_RC_NOMINATED : 0);
+ 	rc->nr_to_reclaim = sc->nr_to_reclaim;
+ 	rc->nr_reclaimed = sc->nr_reclaimed;
+ }
+@@ -1191,6 +1197,7 @@ retry:
+ 		struct folio *folio;
+ 		enum folio_references references = FOLIOREF_RECLAIM;
+ 		unsigned int tier_ext_flags = 0;
++		u64 tier_ext_key = 0;
+ 		bool dirty, writeback;
+ 		unsigned int nr_pages;
+ 
+@@ -1614,9 +1621,13 @@ retry:
+ 			 */
+ 			count_vm_events(PGLAZYFREED, nr_pages);
+ 			count_memcg_folio_events(folio, PGLAZYFREED, nr_pages);
+-		} else if (!mapping || !__remove_mapping(mapping, folio, true,
+-							 sc->target_mem_cgroup))
+-			goto keep_locked;
++		} else {
++			/* the data's identity is lost with the mapping */
++			tier_ext_key = tier_ext_eviction_key(folio);
++			if (!mapping || !__remove_mapping(mapping, folio, true,
++							  sc->target_mem_cgroup))
++				goto keep_locked;
++		}
+ 
+ 		folio_unlock(folio);
+ free_it:
+@@ -1625,7 +1636,7 @@ free_it:
+ 		 * all pages in it.
+ 		 */
+ 		nr_reclaimed += nr_pages;
+-		tier_ext_folio_evicted(folio);
++		tier_ext_folio_evicted(folio, tier_ext_key);
+ 
+ 		folio_unqueue_deferred_split(folio);
+ 		if (folio_batch_add(&free_folios, folio) == 0) {
+@@ -2173,6 +2184,124 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
+ 	return nr_reclaimed;
+ }
+ 
++#ifdef CONFIG_TIER_EXT
++/*
++ * Victim nomination (see D19 in the tier_ext design): the policy of @lruvec
++ * chooses what to reclaim first. @budget is how many pages the engine planned
++ * to scan in this lruvec in this pass; the policy's victims are taken out of
++ * it, in batches of up to TIER_EXT_MAX_VICTIMS folios, until the budget or
++ * the reclaim target is reached or the policy has nothing (valid) left.
++ * @age, if not NULL, runs the engine's aging (TIER_EXT_AGE).
++ *
++ * Returns the pages reclaimed. The caller adds them to sc->nr_reclaimed.
++ * @nr_taken returns the pages isolated per type ([0] anon, [1] file); the
++ * caller takes them out of the default engine's scan budget.
++ */
++static unsigned long tier_ext_reclaim_victims(struct lruvec *lruvec,
++		struct scan_control *sc, int engine, int swappiness,
++		unsigned long budget, unsigned long scan_anon,
++		unsigned long scan_file,
++		bool (*age)(struct lruvec *, struct scan_control *, int),
++		unsigned long *nr_taken)
++{
++	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
++	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
++	unsigned long reclaimed_total = 0;
++	struct tier_ext_reclaim rc;
++	bool aged = false;
++
++	nr_taken[0] = nr_taken[1] = 0;
++	if (!budget || !__tier_ext_has_victims(lruvec))
++		return 0;
++
++	tier_ext_rc(&rc, sc, engine);
++	rc.swappiness = swappiness;
++	rc.reclaim_idx = sc->reclaim_idx;
++	rc.victims_flags = 0;
++	if (swappiness != SWAPPINESS_ANON_ONLY)
++		rc.victims_flags |= TIER_EXT_VF_MAY_FILE;
++	if (swappiness && sc->may_swap &&
++	    can_reclaim_anon_pages(memcg, pgdat->node_id, sc))
++		rc.victims_flags |= TIER_EXT_VF_MAY_ANON;
++	if (sc->may_unmap)
++		rc.victims_flags |= TIER_EXT_VF_MAY_UNMAP;
++	if (age)
++		rc.victims_flags |= TIER_EXT_VF_CAN_AGE;
++	rc.nr_scan_anon = scan_anon;
++	rc.nr_scan_file = scan_file;
++
++	lru_add_drain();
++
++	for (rc.batch = 0; budget; rc.batch++) {
++		unsigned long taken, reclaimed, stolen_file, kept[2] = {};
++		struct tier_ext_victims v;
++		struct reclaim_stat stat;
++		enum node_stat_item item;
++		struct folio *folio;
++		bool just_aged = false;
++
++		rc.nr_requested = budget;
++		rc.nr_reclaimed = sc->nr_reclaimed + reclaimed_total;
++		__tier_ext_pick_victims(lruvec, &rc, &v);
++		taken = v.nr_taken[0] + v.nr_taken[1];
++
++		if (taken) {
++			item = PGSCAN_KSWAPD + reclaimer_offset(sc);
++			mod_lruvec_state(lruvec, item, taken);
++			mod_lruvec_state(lruvec, PGSCAN_ANON, v.nr_taken[0]);
++			mod_lruvec_state(lruvec, PGSCAN_FILE, v.nr_taken[1]);
++
++			sc->tier_ext_nominated = 1;
++			reclaimed = shrink_folio_list(&v.list, pgdat, sc, &stat,
++						      false, memcg);
++			sc->tier_ext_nominated = 0;
++
++			/* hand the survivors back to the policy (D21) */
++			list_for_each_entry(folio, &v.list, lru) {
++				kept[folio_is_file_lru(folio)] += folio_nr_pages(folio);
++				__tier_ext_folio_returned(lruvec, folio);
++			}
++			move_folios_to_lru(&v.list);
++
++			mod_node_page_state(pgdat, NR_ISOLATED_ANON, -v.nr_taken[0]);
++			mod_node_page_state(pgdat, NR_ISOLATED_FILE, -v.nr_taken[1]);
++			mod_lruvec_state(lruvec, PGDEMOTE_KSWAPD + reclaimer_offset(sc),
++					 stat.nr_demoted);
++			item = PGSTEAL_KSWAPD + reclaimer_offset(sc);
++			mod_lruvec_state(lruvec, item, reclaimed);
++			/* the list was mixed; split the steal count by what is left */
++			stolen_file = min(v.nr_taken[1] - min(kept[1], v.nr_taken[1]),
++					  (unsigned long)reclaimed);
++			mod_lruvec_state(lruvec, PGSTEAL_FILE, stolen_file);
++			mod_lruvec_state(lruvec, PGSTEAL_ANON, reclaimed - stolen_file);
++			handle_reclaim_writeback(taken, pgdat, sc, &stat);
++
++			reclaimed_total += reclaimed;
++			nr_taken[0] += v.nr_taken[0];
++			nr_taken[1] += v.nr_taken[1];
++		}
++
++		/* the policy may run out of candidates until the engine ages */
++		if ((v.ret & TIER_EXT_AGE) && !aged) {
++			aged = true;
++			just_aged = age(lruvec, sc, swappiness);
++		}
++		if (!taken && !just_aged)
++			break;
++
++		budget -= min(budget, taken);
++		if (sc->nr_reclaimed + reclaimed_total >= sc->nr_to_reclaim)
++			break;
++		if (fatal_signal_pending(current) ||
++		    (sc->proactive && signal_pending(current)))
++			break;
++		cond_resched();
++	}
++
++	return reclaimed_total;
++}
++#endif /* CONFIG_TIER_EXT */
++
+ /*
+  * shrink_active_list() moves folios from the active LRU to the inactive LRU.
+  *
+@@ -3690,6 +3819,8 @@ static void walk_update_folio(struct lru_gen_mm_walk *walk, struct vm_area_struc
+ 	if (!folio)
+ 		return;
+ 
++	tier_ext_folio_referenced(folio);
++
+ 	if (dirty && !folio_test_dirty(folio) &&
+ 	    !(folio_test_anon(folio) && folio_test_swapbacked(folio) &&
+ 	      !folio_test_swapcache(folio)))
+@@ -5227,6 +5358,49 @@ static bool should_abort_scan(struct lruvec *lruvec, struct scan_control *sc)
+ 	return true;
+ }
+ 
++#ifdef CONFIG_TIER_EXT
++/* TIER_EXT_AGE: a tier_ext policy asked for a generation (page table walk) */
++static bool tier_ext_lru_gen_age(struct lruvec *lruvec, struct scan_control *sc,
++				 int swappiness)
++{
++	DEFINE_MAX_SEQ(lruvec);
++
++	return try_to_inc_max_seq(lruvec, max_seq, swappiness, false);
++}
++
++/* Victim nomination for MGLRU; returns the pages it took from @nr_to_scan. */
++static unsigned long tier_ext_lru_gen_victims(struct lruvec *lruvec,
++					      struct scan_control *sc,
++					      int swappiness, long nr_to_scan)
++{
++	unsigned long taken[2], scan[2] = {};
++	int type;
++
++	if (nr_to_scan <= 0 || !tier_ext_lruvec(lruvec) ||
++	    mem_cgroup_below_min(sc->target_mem_cgroup, lruvec_memcg(lruvec)))
++		return 0;
++
++	/* the type MGLRU itself would scan first, as a hint */
++	type = get_type_to_scan(lruvec, swappiness);
++	scan[type] = nr_to_scan;
++
++	sc->nr_reclaimed += tier_ext_reclaim_victims(lruvec, sc,
++			TIER_EXT_ENGINE_MGLRU, swappiness, nr_to_scan,
++			scan[LRU_GEN_ANON], scan[LRU_GEN_FILE],
++			tier_ext_lru_gen_age, taken);
++
++	/* at priority 0 the default engine still gets its full budget */
++	return sc->priority ? taken[0] + taken[1] : 0;
++}
++#else
++static unsigned long tier_ext_lru_gen_victims(struct lruvec *lruvec,
++					      struct scan_control *sc,
++					      int swappiness, long nr_to_scan)
++{
++	return 0;
++}
++#endif
++
+ /*
+  * For future optimizations:
+  * 1. Defer try_to_inc_max_seq() to workqueues to reduce latency for memcg
+@@ -5244,6 +5418,15 @@ static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 
+ 	swappiness = get_swappiness(lruvec, sc);
+ 	nr_to_scan = get_nr_to_scan(lruvec, sc, memcg, swappiness);
++
++	/* A tier_ext policy may nominate victims before the engine scans. */
++	if (tier_ext_lruvec(lruvec)) {
++		nr_to_scan -= tier_ext_lru_gen_victims(lruvec, sc, swappiness,
++						       nr_to_scan);
++		if (should_abort_scan(lruvec, sc))
++			return need_rotate;
++	}
++
+ 	while (nr_to_scan > 0) {
+ 		int delta;
+ 		DEFINE_MAX_SEQ(lruvec);
+@@ -6153,6 +6336,63 @@ static void lru_gen_shrink_node(struct pglist_data *pgdat, struct scan_control *
+ 
+ #endif /* CONFIG_LRU_GEN */
+ 
++#ifdef CONFIG_TIER_EXT
++/*
++ * Victim nomination for the classic LRU. The policy's victims are taken out
++ * of the scan targets in @nr; if they alone satisfied the reclaim target,
++ * the targets are cleared and the default scan is skipped (never at
++ * priority 0). Returns the pages reclaimed.
++ */
++static unsigned long tier_ext_classic_victims(struct lruvec *lruvec,
++					      struct scan_control *sc,
++					      unsigned long *nr,
++					      bool proportional_reclaim)
++{
++	unsigned long scan_anon = nr[LRU_INACTIVE_ANON] + nr[LRU_ACTIVE_ANON];
++	unsigned long scan_file = nr[LRU_INACTIVE_FILE] + nr[LRU_ACTIVE_FILE];
++	unsigned long reclaimed, taken[2];
++	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
++	enum lru_list lru;
++	int swappiness;
++
++	if (!__tier_ext_has_victims(lruvec))
++		return 0;
++
++	swappiness = tier_ext_swappiness(lruvec, sc, TIER_EXT_ENGINE_CLASSIC,
++					 sc_swappiness(sc, memcg));
++	reclaimed = tier_ext_reclaim_victims(lruvec, sc,
++			TIER_EXT_ENGINE_CLASSIC, swappiness,
++			scan_anon + scan_file, scan_anon, scan_file, NULL, taken);
++
++	if (!sc->priority)
++		return reclaimed;
++
++	if (reclaimed >= sc->nr_to_reclaim && !proportional_reclaim) {
++		for_each_evictable_lru(lru)
++			nr[lru] = 0;
++		return reclaimed;
++	}
++
++	/* charge the victims to the lists they came from, inactive first */
++	for (lru = LRU_INACTIVE_ANON; lru <= LRU_ACTIVE_FILE; lru++) {
++		unsigned long *t = &taken[is_file_lru(lru)];
++		unsigned long d = min(*t, nr[lru]);
++
++		nr[lru] -= d;
++		*t -= d;
++	}
++	return reclaimed;
++}
++#else
++static inline unsigned long tier_ext_classic_victims(struct lruvec *lruvec,
++						     struct scan_control *sc,
++						     unsigned long *nr,
++						     bool proportional_reclaim)
++{
++	return 0;
++}
++#endif
++
+ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ {
+ 	unsigned long nr[NR_LRU_LISTS];
+@@ -6195,6 +6435,12 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 				sc->priority == DEF_PRIORITY);
+ 
+ 	blk_start_plug(&plug);
++
++	/* A tier_ext policy may nominate victims before the engine scans. */
++	if (tier_ext_lruvec(lruvec))
++		nr_reclaimed += tier_ext_classic_victims(lruvec, sc, nr,
++							 proportional_reclaim);
++
+ 	while (nr[LRU_INACTIVE_ANON] || nr[LRU_ACTIVE_FILE] ||
+ 					nr[LRU_INACTIVE_FILE]) {
+ 		unsigned long nr_anon, nr_file, percentage;
+-- 
+2.53.0
+

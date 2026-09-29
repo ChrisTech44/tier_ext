@@ -429,9 +429,182 @@ t_stress() {
 	cg_del te_a; cg_del te_b
 }
 
+# ------------------------------------------------- victim nomination ---
+
+# resident FILE -> "first middle last" percentages of FILE in the page cache
+resident() { "$HERE/te_resident" "$1" 3; }
+
+# MRU: a file read once that does not fit keeps its *first* part in memory,
+# the opposite of every LRU. Impossible with candidate filtering alone.
+mru_run() { # mru_run with|without -> MRU_FIRST MRU_LAST
+	cg_new te_a 200M
+	drop_caches
+	[ "$1" = with ] && { start_policy mru.bpf.o -c $CGROOT/te_a || fail "attach mru"; }
+	fill_cache te_a 0 $DATA/big
+	read -r MRU_FIRST _ MRU_LAST <<< "$(resident $DATA/big)"
+	if [ "$1" = with ]; then
+		MRU_ISOLATED=$(dbg mru victims_isolated)
+		MRU_INVALID=$(dbg mru victims_invalid)
+		stop_policy > /dev/null
+	fi
+	log "mru $1: big file resident first third ${MRU_FIRST}%, last third ${MRU_LAST}%"
+	cg_del te_a; drop_caches
+}
+
+t_mru() {
+	mru_run without; local base_first=$MRU_FIRST base_last=$MRU_LAST
+	mru_run with
+	check "mru: default keeps the end of the file" gt "$base_last" 50
+	check "mru: default drops the start of the file" lt "$base_first" 10
+	check "mru: policy keeps the start of the file (>= 50%)" test "$MRU_FIRST" -ge 50
+	check "mru: victims were isolated" gt "${MRU_ISOLATED:-0}" 100
+	check "mru: no invalid nominations" eq "${MRU_INVALID:-1}" 0
+}
+
+# garbage: nominations that are not the lruvec's folios are harmless. te_b's
+# page cache must survive te_a's reclaim, te_a must still be reclaimed.
+garbage_run() { # garbage_run MODE
+	cg_new te_a 200M; cg_new te_b
+	fill_cache te_b 0 $DATA/b
+	local fb0; fb0=$(mem_stat te_b file)
+	start_policy garbage.bpf.o -c $CGROOT/te_a -s mode="$1" || { fail "attach garbage"; return; }
+	fill_cache te_a 0 $DATA/big
+	fill_cache te_a 0 $DATA/big
+	G_INVALID=$(dbg garbage victims_invalid); G_FOREIGN=$(dbg garbage victims_foreign)
+	G_ISOLATED=$(dbg garbage victims_isolated); G_NOM=$(dbg garbage victims_nominated)
+	G_OTHER=$(( $(dbg garbage victims_skipped) + $(dbg garbage victims_busy) ))
+	stop_policy > /dev/null
+	G_BFILE=$(( fb0 - $(mem_stat te_b file) ))
+	G_PEAK=$(( $(cat $CGROOT/te_a/memory.peak) >> 20 ))
+	log "garbage mode=$1: nominated $G_NOM invalid $G_INVALID foreign $G_FOREIGN isolated $G_ISOLATED; te_b file -${G_BFILE}KiB; te_a peak ${G_PEAK}M"
+	cg_del te_a; cg_del te_b; drop_caches
+}
+
+t_garbage() {
+	garbage_run 0
+	# (a random pfn can be one of te_a's own folios: that one is a
+	# legitimate victim, so isolations are allowed; te_b must not suffer)
+	check "garbage: thousands of bad pfns nominated" gt "${G_NOM:-0}" 1000
+	check "garbage: every nomination accounted for" \
+		eq "$(( G_INVALID + G_FOREIGN + G_ISOLATED + G_OTHER ))" "$G_NOM"
+	check "garbage: nearly all rejected as invalid or foreign" \
+		gt "$(( G_INVALID + G_FOREIGN ))" "$(( G_NOM * 99 / 100 ))"
+	check "garbage: the other cgroup's cache is untouched" lt "$G_BFILE" 4096
+	check "garbage: reclaim still keeps te_a at its limit" lt "$G_PEAK" 202
+	garbage_run 1
+	check "garbage sweep: other cgroups' folios were nominated" gt "${G_FOREIGN:-0}" 0
+	check "garbage sweep: the other cgroup's cache is untouched" lt "$G_BFILE" 4096
+}
+
+# An engine policy (lru, mglru) reclaims a hot file + stream workload and an
+# anon workload larger than the cgroup, on its own victims.
+ANON_PY='
+import mmap, sys
+n = int(sys.argv[1]) << 20
+m = mmap.mmap(-1, n, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+for r in range(3):
+    for i in range(0, n, 4096):
+        m[i] = r
+'
+engine_run() { # engine_run POLICY|default -> E_HOT E_ANON_RC E_SWPOUT E_ISO E_INV E_RET E_NOM
+	cg_new te_a 200M
+	local p=$1
+	E_ISO=0 E_INV=0 E_RET=0 E_NOM=0
+	[ "$p" != default ] && { start_policy "$p.bpf.o" -c $CGROOT/te_a || { fail "attach $p"; return; }; }
+	for _ in 1 2 3 4 5 6 7 8; do fill_cache te_a 0 $DATA/hot; done
+	fill_cache te_a 0 $DATA/big
+	E_HOT=$(fincore -b -n -o RES $DATA/hot | awk '{ print int($1 * 100 / 41943040) }')
+	local sw0; sw0=$(vmstat pswpout)
+	cg_run te_a timeout 180 python3 -c "$ANON_PY" 320; E_ANON_RC=$?
+	E_SWPOUT=$(( $(vmstat pswpout) - sw0 ))
+	if [ "$p" != default ]; then
+		E_ISO=$(dbg "$p" victims_isolated); E_INV=$(dbg "$p" victims_invalid)
+		E_RET=$(dbg "$p" victims_returned); E_NOM=$(dbg "$p" victims_nominated)
+		stop_policy; E_OUT=$OUT
+	fi
+	log "engine $p ($(cat /sys/kernel/mm/lru_gen/enabled)): hot ${E_HOT}% resident, anon rc=$E_ANON_RC pswpout=$E_SWPOUT, victims nominated $E_NOM isolated $E_ISO returned $E_RET invalid $E_INV"
+	cg_del te_a; drop_caches
+}
+
+engine_checks() { # engine_checks POLICY
+	check "$1: anon workload larger than the cgroup completes" eq "$E_ANON_RC" 0
+	check "$1: victims were isolated" gt "$E_ISO" 10000
+	# a stale pfn is possible when a folio is freed while someone else has
+	# it isolated; it must stay rare
+	check "$1: invalid nominations are rare (<0.1%)" test "$E_INV" -le "$(( E_NOM / 1000 ))"
+	check "$1: anon was swapped out" gt "${E_SWPOUT:-0}" 20000
+}
+
+engines_on() { # engines_on y|n: run default, lru and mglru on one kernel engine
+	echo "$1" > /sys/kernel/mm/lru_gen/enabled
+	local k; [ "$1" = y ] && k=MGLRU || k=classic
+	engine_run default; local base=$E_HOT
+	engine_run lru; engine_checks "lru on $k"
+	engine_run mglru; engine_checks "mglru on $k"
+	check "mglru on $k: hot file protected from the stream (>= 90%)" test "$E_HOT" -ge 90
+	check "mglru on $k: page table aging was used" \
+		test "$1" = n -o "$(var "$E_OUT" nr_age_requests)" -gt 0
+	log "engines on $k kernel: hot residency default ${base}%, mglru ${E_HOT}%"
+}
+
+t_engines() {
+	local was; was=$(cat /sys/kernel/mm/lru_gen/enabled)
+	engines_on y
+	engines_on n
+	echo "$was" > /sys/kernel/mm/lru_gen/enabled
+}
+
+# Lifecycle events: freed folios (folio_removed), migrated folios
+# (folio_migrated, followed by folio_added on the new node's lruvec).
+t_events() {
+	cg_new te_a
+	start_policy lru.bpf.o -c $CGROOT/te_a || { fail "attach lru"; return; }
+	cp $DATA/a $DATA/tmp_a
+	drop_caches	# the copy is charged to us; te_a must read it in
+	fill_cache te_a 0 $DATA/tmp_a
+	rm -f $DATA/tmp_a
+	sleep 0.5
+	local removed; removed=$(dbg lru folio_removed)
+	check "events: deleting a cached file reports folio_removed" gt "${removed:-0}" 20
+	start_anon te_a 0 200
+	migratepages "$HOLDER_PID" 0 1
+	local mig a1; mig=$(dbg lru folio_migrated); a1=$(numa_stat te_a anon 1)
+	check "events: migratepages moved anon to node 1" gt "$a1" 150000
+	# folios, not pages: 200M of anon is ~100 THPs plus small folios
+	check "events: migration reports folio_migrated" gt "${mig:-0}" 50
+	# the policy now reclaims node 1's lruvec from its own victims
+	local iso0; iso0=$(dbg lru victims_isolated)
+	reclaim te_a 150M
+	local iso1 inv; iso1=$(dbg lru victims_isolated); inv=$(dbg lru victims_invalid)
+	check "events: migrated folios are reclaimed as victims on node 1" gt "$(( iso1 - iso0 ))" 20
+	check "events: no invalid nominations after migration" eq "${inv:-1}" 0
+	stop_anon
+	stop_policy > /dev/null
+	cg_del te_a; drop_caches
+}
+
+# Attach/detach engine policies under memory pressure, on both nodes.
+t_engine_stress() {
+	cg_new te_a 256M; cg_new te_b 256M
+	cg_run te_a timeout 70 stress-ng --vm 2 --vm-bytes 400M --page-in -q &
+	cg_run te_b timeout 70 sh -c "while :; do cat $DATA/big $DATA/a > /dev/null; done" &
+	local end=$((SECONDS + 50)) n=0 ok=1 p
+	while [ $SECONDS -lt $end ]; do
+		for p in mglru lru mru garbage; do
+			"$LOAD" -q -c $CGROOT/te_a "$HERE/$p.bpf.o" -- sleep 0.4 2>/dev/null || ok=0
+			"$LOAD" -q -c $CGROOT/te_b "$HERE/$p.bpf.o" -- sleep 0.3 2>/dev/null || ok=0
+			n=$((n + 2))
+		done
+	done
+	wait
+	check "engine stress: $n attach/detach cycles under pressure" test $ok -eq 1
+	check "engine stress: no policy left attached" eq "$(grep -c policy $DBG)" 0
+	cg_del te_a; cg_del te_b
+}
+
 # ------------------------------------------------------------------- main ---
 
-ALL="attach per_node attach_rules swappiness protect stream tier_demote pin lfu classic stress"
+ALL="attach per_node attach_rules swappiness protect stream tier_demote pin lfu classic stress mru garbage engines events engine_stress"
 setup
 for t in ${@:-$ALL}; do
 	log "=== $t"

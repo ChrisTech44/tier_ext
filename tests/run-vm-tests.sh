@@ -37,6 +37,7 @@ scripts/run-vm.sh -d -s -c "$TOPO" "${QEMU_EXTRA[@]}"
 trap 'cd "$LINUXDEV" && scripts/stop-vm.sh >/dev/null 2>&1 || true; rm -rf "${SWAPDIR:-}"' EXIT
 
 $SSH 'mkdir -p /tmp/te'
-$SCP "$ROOT"/policies/build/tier_ext_load "$ROOT"/policies/build/*.bpf.o \
+$SCP "$ROOT"/policies/build/tier_ext_load "$ROOT"/policies/build/te_resident \
+	"$ROOT"/policies/build/*.bpf.o \
 	"$ROOT"/tests/guest/tier_ext_tests.sh tiervm:/tmp/te/
 $SSH "sudo TE_SWAP=$SWAP /tmp/te/tier_ext_tests.sh $*"

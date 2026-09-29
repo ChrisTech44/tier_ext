@@ -10,6 +10,10 @@
  * a COMMAND, the command runs while the policy is attached and its exit code
  * is returned; otherwise the policy stays attached until SIGINT/SIGTERM. On
  * exit the policy's global variables (counters) are printed, unless -q.
+ *
+ * Engine policies (te_engine.bpf.h) contain a "te_init" syscall program; it is
+ * run once after loading with the machine's highest pfn, to allocate the
+ * per-pfn node array. A global variable "max_pfn" is set the same way.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -20,6 +24,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <bpf/bpf.h>
 #include <bpf/btf.h>
 #include <bpf/libbpf.h>
 
@@ -74,6 +79,54 @@ static int parse_nodes(const char *s, unsigned long long *mask)
 	return 0;
 }
 
+/* One past the highest pfn of any zone, from /proc/zoneinfo. */
+static unsigned long long read_max_pfn(void)
+{
+	unsigned long long spanned = 0, start, max = 0;
+	char line[256];
+	FILE *f = fopen("/proc/zoneinfo", "r");
+
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, " spanned %llu", &spanned) == 1)
+			continue;
+		if (sscanf(line, " start_pfn: %llu", &start) == 1 &&
+		    start + spanned > max)
+			max = start + spanned;
+	}
+	fclose(f);
+	return max;
+}
+
+/* Run the engine library's te_init program, if the policy has one. */
+static int run_te_init(struct bpf_object *obj, unsigned long long max_pfn)
+{
+	struct { __u64 max_pfn; } args = { max_pfn };
+	LIBBPF_OPTS(bpf_test_run_opts, opts,
+		.ctx_in = &args,
+		.ctx_size_in = sizeof(args),
+	);
+	struct bpf_program *prog;
+	int err;
+
+	prog = bpf_object__find_program_by_name(obj, "te_init");
+	if (!prog)
+		return 0;
+	if (!max_pfn) {
+		fprintf(stderr, "cannot read the highest pfn from /proc/zoneinfo\n");
+		return -EINVAL;
+	}
+	err = bpf_prog_test_run_opts(bpf_program__fd(prog), &opts);
+	if (err)
+		return err;
+	if (opts.retval) {
+		fprintf(stderr, "te_init failed: %d\n", (int)opts.retval);
+		return opts.retval;
+	}
+	return 0;
+}
+
 /* Find a global variable in the object's .bss/.data/.rodata. */
 static void *find_var(struct bpf_object *obj, const char *name,
 		      const struct btf_type **type, struct bpf_map **mapp)
@@ -122,7 +175,8 @@ static int set_var(struct bpf_object *obj, const char *assign)
 {
 	struct btf *btf = bpf_object__btf(obj);
 	const struct btf_type *var;
-	char name[128], *eq;
+	char name[128];
+	const char *eq;
 	long long val;
 	void *p;
 	__s64 sz;
@@ -265,7 +319,7 @@ static void dump_vars(struct bpf_object *obj)
 int main(int argc, char **argv)
 {
 	const char *cgdir = NULL, *sets[MAX_SETS], *path;
-	unsigned long long cgid = 0, mask = 0;
+	unsigned long long cgid = 0, mask = 0, max_pfn;
 	int nsets = 0, quiet = 0, opt, err, status = 0;
 	struct bpf_object *obj;
 	struct bpf_link *links[16];
@@ -330,6 +384,13 @@ int main(int argc, char **argv)
 		snprintf(buf, sizeof(buf), "expect_cgroup=%llu", cgid);
 		set_var(obj, buf);
 	}
+	max_pfn = read_max_pfn();
+	if (find_var(obj, "max_pfn", NULL, NULL) && max_pfn) {
+		char buf[64];
+
+		snprintf(buf, sizeof(buf), "max_pfn=%llu", max_pfn);
+		set_var(obj, buf);
+	}
 	for (i = 0; i < nsets; i++)
 		if (set_var(obj, sets[i]))
 			return 1;
@@ -337,6 +398,11 @@ int main(int argc, char **argv)
 	err = bpf_object__load(obj);
 	if (err) {
 		fprintf(stderr, "failed to load %s: %s\n", path, strerror(-err));
+		return 1;
+	}
+	err = run_te_init(obj, max_pfn);
+	if (err) {
+		fprintf(stderr, "failed to initialise %s: %s\n", path, strerror(-err));
 		return 1;
 	}
 

@@ -1,0 +1,61 @@
+From c518391c00f809ddc70e8fe8f7a9b8fac11913c5 Mon Sep 17 00:00:00 2001
+From: Christian Franklin <cfranklin4474@gmail.com>
+Date: Tue, 29 Sep 2026 18:52:41 -0400
+Subject: [PATCH 4/4] mm/tier_ext: flush MGLRU walk batches after victims,
+ report folios freed on putback
+
+Reclaiming nominated folios on MGLRU runs look-around, which batches
+generation size updates in current->reclaim_state->mm_walk; flush them
+like evict_folios() does, or clear_mm_walk() warns about leftovers.
+
+move_folios_to_lru() frees a folio whose last reference went away while
+it was isolated. Report that as folio_removed, so policies that track
+pfns do not keep a stale entry (it showed up as the occasional invalid
+nomination).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mm/vmscan.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 947a4961e..485ae0609 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2036,6 +2036,8 @@ static unsigned int move_folios_to_lru(struct list_head *list)
+ 		folio_set_lru(folio);
+ 
+ 		if (unlikely(folio_put_testzero(folio))) {
++			/* the last reference went away while it was isolated */
++			tier_ext_folio_removed(lruvec, folio);
+ 			__folio_clear_lru_flags(folio);
+ 
+ 			folio_unqueue_deferred_split(folio);
+@@ -5374,6 +5376,7 @@ static unsigned long tier_ext_lru_gen_victims(struct lruvec *lruvec,
+ 					      int swappiness, long nr_to_scan)
+ {
+ 	unsigned long taken[2], scan[2] = {};
++	struct lru_gen_mm_walk *walk;
+ 	int type;
+ 
+ 	if (nr_to_scan <= 0 || !tier_ext_lruvec(lruvec) ||
+@@ -5389,6 +5392,16 @@ static unsigned long tier_ext_lru_gen_victims(struct lruvec *lruvec,
+ 			scan[LRU_GEN_ANON], scan[LRU_GEN_FILE],
+ 			tier_ext_lru_gen_age, taken);
+ 
++	/*
++	 * Like evict_folios(): look-around during reclaim of the victims may
++	 * have batched generation size updates for this lruvec.
++	 */
++	walk = current->reclaim_state->mm_walk;
++	if (walk && walk->batched) {
++		walk->lruvec = lruvec;
++		reset_batch_size(walk);
++	}
++
+ 	/* at priority 0 the default engine still gets its full budget */
+ 	return sc->priority ? taken[0] + taken[1] : 0;
+ }
+-- 
+2.53.0
+

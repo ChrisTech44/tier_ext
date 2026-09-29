@@ -46,4 +46,8 @@ static __always_inline bool te_anon(const struct tier_ext_folio_ctx *ctx)
 /* Page-count helpers use u64 counters in a per-node array. */
 #define TE_MAX_NODES 64
 
+/* #defines of linux/tier_ext.h, which BTF does not carry */
+#define TIER_EXT_MAX_VICTIMS	32
+#define TIER_EXT_KEY_SWAP	(1ULL << 63)
+
 #endif /* __TIER_EXT_BPF_H */
