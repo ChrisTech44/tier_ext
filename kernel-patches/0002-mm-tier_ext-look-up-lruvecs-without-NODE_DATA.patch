@@ -1,7 +1,7 @@
 From 8ba8f9a83cce9514545b4674c2c66a7635360df3 Mon Sep 17 00:00:00 2001
 From: Christian Franklin <cfranklin4474@gmail.com>
 Date: Tue, 29 Sep 2026 16:08:08 -0400
-Subject: [PATCH 2/5] mm/tier_ext: look up lruvecs without NODE_DATA()
+Subject: [PATCH 2/6] mm/tier_ext: look up lruvecs without NODE_DATA()
 
 Every possible node has a per-memcg lruvec from memcg creation on, but
 NODE_DATA() may be NULL for possible nodes that never came online. Use

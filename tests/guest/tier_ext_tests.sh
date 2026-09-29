@@ -681,6 +681,30 @@ t_events() {
 	cg_del te_a; drop_caches
 }
 
+# Replacing a policy in place (BPF_LINK_UPDATE): the lruvec never runs
+# without one, and the new policy takes over immediately.
+t_update() {
+	cg_new te_a 200M
+	LOADER_OUT=$(mktemp)
+	"$LOAD" -c $CGROOT/te_a -u "$HERE/mglru.bpf.o" "$HERE/lru.bpf.o" > "$LOADER_OUT" 2>&1 &
+	LOADER_PID=$!
+	for _ in $(seq 50); do grep -q attached "$LOADER_OUT" && break; sleep 0.1; done
+	fill_cache te_a 0 $DATA/big
+	check "update: lru attached first" grep -q "policy lru cgroup" $DBG
+	kill -USR1 $LOADER_PID
+	for _ in $(seq 50); do grep -q "replaced by" "$LOADER_OUT" && break; sleep 0.1; done
+	check "update: the loader replaced the policy" grep -q "replaced by mglru" "$LOADER_OUT"
+	check "update: debugfs shows mglru on the same cgroup" grep -q "policy mglru cgroup $(cg_id te_a)" $DBG
+	check "update: no gap (one policy listed, never detached)" eq "$(grep -c policy $DBG)" 1
+	fill_cache te_a 0 $DATA/big
+	local iso; iso=$(dbg mglru victims_isolated)
+	check "update: the new policy reclaims" gt "${iso:-0}" 100
+	stop_policy > /dev/null
+	check "update: kernel log shows the replacement" sh -c "dmesg | grep -q \"replaced policy 'lru' with 'mglru'\""
+	check "update: nothing attached after exit" eq "$(grep -c policy $DBG)" 0
+	cg_del te_a; drop_caches
+}
+
 # Attach/detach engine policies under memory pressure, on both nodes.
 t_engine_stress() {
 	cg_new te_a 256M; cg_new te_b 256M
@@ -702,7 +726,7 @@ t_engine_stress() {
 
 # ------------------------------------------------------------------- main ---
 
-ALL="attach per_node attach_rules swappiness protect stream tier_demote pin lfu classic stress mru garbage engines ports lfu_mmap events engine_stress"
+ALL="attach per_node attach_rules swappiness protect stream tier_demote pin lfu classic stress mru garbage engines ports lfu_mmap events update engine_stress"
 setup
 for t in ${@:-$ALL}; do
 	log "=== $t"

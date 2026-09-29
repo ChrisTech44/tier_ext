@@ -47,14 +47,31 @@ Workloads and tiers differ, though:
 
 ## Non-goals (for now)
 
-* **Arbitrary victim selection.** The policy judges the folios the kernel's
-  scanner presents (the cold end of the lists). It cannot say "evict that
-  specific folio over there". See [decisions.md](decisions.md), D3.
-* **Replacing aging.** How MGLRU creates generations, and how the classic LRU
-  deactivates active folios, is unchanged.
+* **Replacing the kernel's own aging.** How MGLRU creates generations, and
+  how the classic LRU deactivates active folios, is unchanged. Engine
+  policies (below) bring their own aging instead.
 * **Choosing the demotion target.** A policy can forbid or require demotion,
   but the kernel still picks which slower node receives the folio.
 * **Promotion** (moving hot folios up to a faster tier) is a NUMA-balancing
   decision, not a reclaim decision, and is out of scope.
 * **Hierarchical policies.** A policy applies to exactly one memcg, not to its
   descendants. See D5.
+
+## Phase 2: complete reclaim algorithms per lruvec
+
+The first version deliberately left out **arbitrary victim selection** (D3):
+a policy could only judge the folios the kernel's scanner presented. Phase 2
+added it (D19–D29), with the goal of reaching cache_ext-level expressiveness
+while keeping everything above:
+
+8. **Engines.** A policy can keep its own ordering of folios and choose every
+   victim, i.e. implement a complete reclaim algorithm (FIFO, MRU, S3-FIFO,
+   LHD, LFU, or the kernel's own LRU and MGLRU re-implemented in BPF), for
+   **anon memory as well as page cache**, per lruvec, on either kernel engine.
+9. **Still safe.** Nominations are page frame numbers the kernel re-validates;
+   a hostile policy cannot reclaim another cgroup's memory, reduce reclaim,
+   or crash the kernel.
+10. **Still a fallback.** What an engine does not cover is reclaimed by the
+    kernel's engine, as before.
+
+See [engines.md](engines.md).

@@ -20,7 +20,7 @@ LIBBPF_INC := $(LIBBPF_OUT)/include
 POLICIES := $(patsubst %.bpf.c,%,$(wildcard *.bpf.c))
 BPF_OBJS := $(addprefix $(BUILD)/,$(addsuffix .bpf.o,$(POLICIES)))
 
-all: $(BUILD)/tier_ext_load $(BUILD)/te_resident $(BPF_OBJS)
+all: $(BUILD)/tier_ext_load $(BUILD)/te_resident $(BUILD)/te_touch $(BPF_OBJS)
 
 $(BUILD):
 	mkdir -p $@
@@ -43,6 +43,9 @@ $(BUILD)/tier_ext_load: tier_ext_load.c $(LIBBPF_A)
 
 # guest-side test helper (static, so it runs in any VM image)
 $(BUILD)/te_resident: ../tests/guest/te_resident.c | $(BUILD)
+	$(CC) -O2 -Wall -static $< -o $@
+
+$(BUILD)/te_touch: ../bench/guest/te_touch.c | $(BUILD)
 	$(CC) -O2 -Wall -static $< -o $@
 
 clean:

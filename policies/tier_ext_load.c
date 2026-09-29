@@ -3,7 +3,7 @@
  * tier_ext_load: attach a tier_ext BPF policy to (cgroup, nodes).
  *
  *   tier_ext_load [-c CGROUP_DIR | -i CGROUP_ID] [-n NODELIST] [-s VAR=VAL]...
- *                 [-q] POLICY.bpf.o [-- COMMAND ARGS...]
+ *                 [-q] [-u NEXT.bpf.o] POLICY.bpf.o [-- COMMAND ARGS...]
  *
  * Opens POLICY.bpf.o, points every struct tier_ext_ops in it at the cgroup
  * and nodes, sets global variables given with -s, loads and attaches it. With
@@ -42,13 +42,14 @@ static void on_signal(int sig)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"usage: %s [-c CGROUP_DIR | -i CGROUP_ID] [-n NODELIST] [-s VAR=VAL]... [-q]\n"
+		"usage: %s [-c CGROUP_DIR | -i CGROUP_ID] [-n NODELIST] [-s VAR=VAL]... [-q] [-u NEXT.bpf.o]\n"
 		"          POLICY.bpf.o [-- COMMAND ARGS...]\n"
 		"  -c  cgroup v2 directory (default: root cgroup)\n"
 		"  -i  cgroup id instead of a directory\n"
 		"  -n  NUMA nodes, e.g. 0 or 0,2-3 (default: all)\n"
 		"  -s  set a global variable of the policy before loading\n"
-		"  -q  do not print the policy's variables on exit\n", prog);
+		"  -q  do not print the policy's variables on exit\n"
+		"  -u  load NEXT.bpf.o too, and replace the policy with it on SIGUSR1\n", prog);
 	exit(2);
 }
 
@@ -129,6 +130,18 @@ static int run_te_init(struct bpf_object *obj, unsigned long long max_pfn)
 	return 0;
 }
 
+/*
+ * -u NEXT.bpf.o: NEXT is loaded for the same target up front; on SIGUSR1 the
+ * link is updated to it, which replaces the policy without detaching
+ * (tier_ext_ops .update).
+ */
+static volatile sig_atomic_t swap_requested;
+
+static void on_usr1(int sig)
+{
+	swap_requested = 1;
+}
+
 /* Run the policy's te_periodic program, if it has one. */
 static void run_periodic(struct bpf_program *prog)
 {
@@ -136,6 +149,25 @@ static void run_periodic(struct bpf_program *prog)
 
 	if (prog)
 		bpf_prog_test_run_opts(bpf_program__fd(prog), &opts);
+}
+
+/* On SIGUSR1 with -u: replace the attached policy by the next one. */
+static void maybe_swap(struct bpf_link *link, struct bpf_map *next_map,
+		       struct bpf_program **periodic, struct bpf_object *next)
+{
+	int err;
+
+	if (!swap_requested || !next_map)
+		return;
+	swap_requested = 0;
+	err = bpf_link__update_map(link, next_map);
+	if (err) {
+		fprintf(stderr, "tier_ext: replacing the policy failed: %s\n",
+			strerror(-err));
+		return;
+	}
+	*periodic = bpf_object__find_program_by_name(next, "te_periodic");
+	fprintf(stderr, "tier_ext: replaced by %s\n", bpf_map__name(next_map));
 }
 
 /* Find a global variable in the object's .bss/.data/.rodata. */
@@ -329,7 +361,9 @@ static void dump_vars(struct bpf_object *obj)
 
 int main(int argc, char **argv)
 {
-	const char *cgdir = NULL, *sets[MAX_SETS], *path;
+	const char *cgdir = NULL, *sets[MAX_SETS], *path, *next_path = NULL;
+	struct bpf_object *next = NULL;
+	struct bpf_map *next_map = NULL;
 	unsigned long long cgid = 0, mask = 0, max_pfn;
 	int nsets = 0, quiet = 0, opt, err, status = 0;
 	struct bpf_program *periodic;
@@ -340,7 +374,7 @@ int main(int argc, char **argv)
 	char **cmd = NULL;
 	pid_t child = 0;
 
-	while ((opt = getopt(argc, argv, "+c:i:n:s:qh")) != -1) {
+	while ((opt = getopt(argc, argv, "+c:i:n:s:u:qh")) != -1) {
 		switch (opt) {
 		case 'c': cgdir = optarg; break;
 		case 'i': cgid = strtoull(optarg, NULL, 0); break;
@@ -356,6 +390,7 @@ int main(int argc, char **argv)
 			sets[nsets++] = optarg;
 			break;
 		case 'q': quiet = 1; break;
+		case 'u': next_path = optarg; break;
 		default: usage(argv[0]);
 		}
 	}
@@ -417,6 +452,18 @@ int main(int argc, char **argv)
 		fprintf(stderr, "failed to initialise %s: %s\n", path, strerror(-err));
 		return 1;
 	}
+	if (next_path) {
+		next = bpf_object__open_file(next_path, NULL);
+		if (!next || set_target(next, cgid, mask) || bpf_object__load(next) ||
+		    run_te_init(next, max_pfn)) {
+			fprintf(stderr, "failed to load %s\n", next_path);
+			return 1;
+		}
+		bpf_object__for_each_map(next_map, next)
+			if (bpf_map__type(next_map) == BPF_MAP_TYPE_STRUCT_OPS)
+				break;
+		signal(SIGUSR1, on_usr1);
+	}
 
 	bpf_object__for_each_map(map, obj) {
 		struct bpf_link *link;
@@ -439,6 +486,8 @@ int main(int argc, char **argv)
 	signal(SIGTERM, on_signal);
 
 	periodic = bpf_object__find_program_by_name(obj, "te_periodic");
+	if (next_map && !nlinks)
+		next_map = NULL;
 	if (cmd) {
 		child = fork();
 		if (child == 0) {
@@ -456,13 +505,15 @@ int main(int argc, char **argv)
 			if (r == 0) {	/* still running: te_periodic every ~1s */
 				if (i % 20 == 0)
 					run_periodic(periodic);
+				maybe_swap(links[0], next_map, &periodic, next);
 				usleep(50 * 1000);
 			}
 		}
 		status = WIFEXITED(status) ? WEXITSTATUS(status) : 128;
 	} else {
 		while (!stop) {
-			if (periodic) {
+			maybe_swap(links[0], next_map, &periodic, next);
+			if (periodic || next_map) {
 				run_periodic(periodic);
 				sleep(1);
 			} else {
@@ -476,6 +527,12 @@ out:
 		bpf_link__destroy(links[i]);
 	if (!quiet && nlinks)
 		dump_vars(obj);
+	if (!quiet && next) {
+		printf("-- %s\n", next_path);
+		dump_vars(next);
+	}
 	bpf_object__close(obj);
+	if (next)
+		bpf_object__close(next);
 	return err ? 1 : status;
 }

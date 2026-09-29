@@ -12,8 +12,9 @@ terminate, only touch memory they may, and only call approved helpers.
 
 On top of that, tier_ext makes the kernel's data **read-only** to policies
 (`btf_struct_access` rejects every write). A policy can read `struct folio`
-fields but cannot change flags, lists or counters. Its only way to influence
-reclaim is its **return value**, which the kernel validates.
+fields but cannot change flags, lists or counters. Its only ways to influence
+reclaim are its **return values** and the **pfns it nominates**, and the
+kernel validates both (section 6).
 
 ## 2. Atomic context: callbacks cannot sleep
 
@@ -78,7 +79,62 @@ applied regardless of its answer:
   BPF programs are reentrant, but a policy that keeps per-CPU scratch state
   must tolerate it.
 
-## 6. Cost when unused
+## 6. Victim nomination: a pfn is only a suggestion
+
+A policy that nominates victims hands the kernel numbers, never pointers.
+Each pfn goes through the checks compaction uses for pages it does not own:
+
+1. `pfn_to_online_page()`: the pfn is in online memory (garbage, holes, device
+   memory and offline sections return NULL);
+2. `folio_get_nontail_page()`: take a reference, which fails for free pages
+   (refcount 0) and tail pages, so the folio cannot be freed or merged into
+   a larger one while it is examined;
+3. `folio_test_lru()`: it is on an LRU list, i.e. a user folio (only then is
+   its memcg read);
+4. `folio_lruvec() == lruvec`: it belongs to the lruvec being reclaimed, so a
+   policy can never make another cgroup, or another node, lose memory;
+5. the restrictions of this reclaim pass (zone, may-swap, may-unmap,
+   unevictable), exactly as the engine's own scanner applies them;
+6. `folio_isolate_lru()`, which handles races with every other isolator.
+
+What passes is reclaimed by the ordinary `shrink_folio_list()`: locking,
+writeback, swap allocation, demotion and freeing are the kernel's code. The
+`garbage` test policy nominates 20,000 random, low and swept pfns per run:
+all are rejected or are the cgroup's own folios, another cgroup's page cache
+is untouched, and reclaim of the policy's cgroup still meets its limit.
+
+**Reclaim can only increase.** Nominated pages are taken out of the engine's
+scan budget, but only after they were reclaimed or tried; a policy that
+nominates nothing, or garbage, leaves the engine its whole budget. At
+priority 0 the engine gets its full budget in any case.
+
+**Every loop is bounded.** At most 32 pfns per call (the kfunc refuses more
+and the kernel caps `nr` again). The batch loop stops when the scan budget
+is used, the reclaim target is met, a fatal signal arrives, or a batch
+yields nothing; `TIER_EXT_AGAIN` extends that by at most 16 empty batches,
+and `TIER_EXT_AGE` runs the engine's aging at most once per pass.
+
+**The kfunc is confined.** `bpf_tier_ext_add_victim()` is only available to
+`tier_ext_ops.pick_victims` programs (a kfunc filter checks the struct_ops
+type and member) and only writes inside the context it is given.
+
+## 7. Engine policies: locks and arena memory
+
+Engine policies hold a `bpf_spin_lock` while they change their lists. That
+lock disables interrupts, and the verifier forbids helper calls and anything
+that could sleep while it is held; the only kernel function called under it
+is `bpf_tier_ext_add_victim()`, which takes no locks. So the lock nests
+inside whatever the kernel holds when it calls the policy (for
+`folio_added`, the LRU lock) and never the other way round: no lock
+inversion is possible.
+
+Their per-pfn nodes live in a BPF arena. A policy with a bug can corrupt its
+own lists, but arena memory is separate from kernel memory: an access
+outside the arena's allocated pages is caught by the BPF exception handler
+(reads see 0, writes are dropped). Corrupt lists only produce bad
+nominations, which section 6 makes harmless.
+
+## 8. Cost when unused
 
 All hook sites are behind a static key (`tier_ext_attached`) that is off until
 the first policy attaches, plus a per-lruvec pointer test. Without

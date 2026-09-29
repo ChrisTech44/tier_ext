@@ -1,7 +1,7 @@
 From bf59b6f5688f6fdf4de2955d1ba15f22f91636a3 Mon Sep 17 00:00:00 2001
 From: Christian Franklin <cfranklin4474@gmail.com>
 Date: Tue, 29 Sep 2026 18:29:58 -0400
-Subject: [PATCH 3/5] mm/tier_ext: victim nomination (pick_victims) and
+Subject: [PATCH 3/6] mm/tier_ext: victim nomination (pick_victims) and
  lifecycle events
 
 Let a tier_ext policy choose what to reclaim, not only judge what the

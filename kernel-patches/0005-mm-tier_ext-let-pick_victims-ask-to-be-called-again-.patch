@@ -1,7 +1,7 @@
 From 6652ac3249d9041ad58e194ddc4a23053583e13d Mon Sep 17 00:00:00 2001
 From: Christian Franklin <cfranklin4474@gmail.com>
 Date: Tue, 29 Sep 2026 19:07:00 -0400
-Subject: [PATCH 5/5] mm/tier_ext: let pick_victims ask to be called again
+Subject: [PATCH 5/6] mm/tier_ext: let pick_victims ask to be called again
  (TIER_EXT_AGAIN)
 
 A policy that rotates folios (second chances, S3-FIFO's main queue,
