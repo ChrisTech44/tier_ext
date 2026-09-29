@@ -8,7 +8,8 @@
  * reaches a folio,
  *   - keeps it if it was accessed at least hot_threshold times (and halves
  *     the count, so protection decays unless the folio stays hot);
- *   - evicts it immediately if it was never accessed since it was added;
+ *   - evicts it immediately if it was used at most once (a streaming read
+ *     touches each folio exactly once);
  *   - otherwise leaves the decision to the kernel.
  * Anon folios are not affected. Entries are dropped on eviction; the LRU hash
  * bounds the memory used if some are missed (e.g. folios freed by truncation).
@@ -78,7 +79,7 @@ static __always_inline s32 decide(struct tier_ext_folio_ctx *ctx)
 		__sync_fetch_and_add(&nr_keep, 1);
 		return TIER_EXT_KEEP;
 	}
-	if (*cnt == 0 && !(ctx->folio_flags & TIER_EXT_F_MAPPED)) {
+	if (*cnt <= 1 && !(ctx->folio_flags & TIER_EXT_F_MAPPED)) {
 		__sync_fetch_and_add(&nr_evict_cold, 1);
 		return TIER_EXT_RECLAIM;
 	}

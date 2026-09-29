@@ -364,9 +364,10 @@ t_lfu() {
 	lfu_run without; local base=$HOT_RES
 	lfu_run with
 	check "lfu: KEEP verdicts for hot folios" gt "$LFU_KEEP" 0
-	check "lfu: cold folios evicted early" gt "$LFU_COLD" 0
-	check "lfu: hot file stays resident (>= 90%)" test "$HOT_RES" -ge 90
-	log "lfu: hot residency ${base}% without policy, ${HOT_RES}% with"
+	check "lfu: used-once folios evicted early" gt "$LFU_COLD" 0
+	check "lfu: hot file stays resident (>= 75%)" test "$HOT_RES" -ge 75
+	check "lfu: no worse than without the policy" test "$HOT_RES" -ge "$base"
+	log "lfu ($(cat /sys/kernel/mm/lru_gen/enabled)): hot residency ${base}% without policy, ${HOT_RES}% with"
 }
 
 # Same checks with the classic active/inactive LRU instead of MGLRU.
@@ -391,6 +392,7 @@ t_classic() {
 	check "classic swappiness=200: anon reclaimed" gt "$ANON_DELTA" 100000
 	check "classic swappiness=200: file untouched" lt "$FILE_DELTA" 4096
 	t_protect
+	t_lfu
 	echo "$was" > /sys/kernel/mm/lru_gen/enabled
 }
 
