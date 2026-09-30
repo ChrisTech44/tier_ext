@@ -143,6 +143,7 @@ Differences from the kernel:
 | aging walks page tables itself | asks the kernel for the walk (`TIER_EXT_AGE`); on the classic engine there is no walk, and young page table entries are only seen when a nominated folio is reclaimed (the kernel then activates it) |
 | per-memcg generation balancing (`memcg_lru`) | not needed: one policy is one memcg |
 | `min_ttl_ms` thrashing prevention | not implemented |
+| rejected folios leave the oldest generation (`evict_folios()` marks them active) | same: a victim handed back that would land in the oldest generation is placed as active. Without this rule, read-ahead still locked for I/O was nominated over and over; page cache reclaim cost 74% more than the kernel's, 13% with it |
 
 On the classic kernel engine `mglru` still works; it then brings MGLRU's
 behaviour to a machine running the classic LRU. In the tests it keeps a

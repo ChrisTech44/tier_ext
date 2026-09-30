@@ -1,0 +1,35 @@
+From 4a2d8217e3332c0836cb7d53e97738221c132850 Mon Sep 17 00:00:00 2001
+From: Christian Franklin <cfranklin4474@gmail.com>
+Date: Tue, 29 Sep 2026 20:03:26 -0400
+Subject: [PATCH 7/7] mm/tier_ext: no WARN when an isolated victim's lruvec
+ changed
+
+A racing reparent of a dying memcg can move a folio's charge; count it
+as foreign instead of warning.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mm/tier_ext.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/mm/tier_ext.c b/mm/tier_ext.c
+index e174dd0c1..24a907458 100644
+--- a/mm/tier_ext.c
++++ b/mm/tier_ext.c
+@@ -663,8 +663,11 @@ static enum tier_ext_stat tier_ext_isolate_victim(struct tier_ext_policy *p,
+ 		res = TES_VICTIM_BUSY;
+ 		goto put;
+ 	}
+-	/* an isolated folio keeps its memcg, but be paranoid */
+-	if (WARN_ON_ONCE(folio_lruvec(folio) != lruvec)) {
++	/*
++	 * An isolated folio normally keeps its memcg; if it changed anyway
++	 * (e.g. a racing reparent of a dying memcg), it is not ours.
++	 */
++	if (unlikely(folio_lruvec(folio) != lruvec)) {
+ 		folio_putback_lru(folio);
+ 		res = TES_VICTIM_FOREIGN;
+ 		goto put;
+-- 
+2.53.0
+

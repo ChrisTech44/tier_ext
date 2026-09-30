@@ -19,18 +19,23 @@
 #   anon_fault   write 1 GiB of fresh anon memory, no limit (lru_add path)
 #   anon_reclaim write 512 MiB of anon 3 times in a 256 MiB cgroup (zram swap)
 #
-#   overhead.sh [-r ROUNDS] [-s "none other observe lru mglru"] [-w "..."]
+# After setting up (attaching, or nothing) every run waits SETTLE seconds
+# (-d, default 2), so that deferred work from loading a policy (JIT, text
+# patching for the static key, RCU callbacks) is not timed.
+#
+#   overhead.sh [-r ROUNDS] [-d SETTLE] [-s "none other observe lru mglru"] [-w "..."]
 
 set -u
 cd "$(dirname "$0")"
 DATA=/var/tmp/tier_ext
 CG=/sys/fs/cgroup/bench
 OTHER=/sys/fs/cgroup/bench_other
-ROUNDS=5 SETUPS="none other observe lru mglru"
+ROUNDS=5 SETTLE=2 SETUPS="none other observe lru mglru"
 WORKLOADS="pc_reclaim pc_hit anon_fault anon_reclaim"
-while getopts "r:s:w:" o; do
+while getopts "r:d:s:w:" o; do
 	case $o in
 	r) ROUNDS=$OPTARG ;;
+	d) SETTLE=$OPTARG ;;
 	s) SETUPS=$OPTARG ;;
 	w) WORKLOADS=$OPTARG ;;
 	*) exit 2 ;;
@@ -92,6 +97,7 @@ run() { # run SETUP WORKLOAD ROUND
 	if [ -n "$lp" ]; then
 		for _ in $(seq 50); do grep -q attached /tmp/oh.out && break; sleep 0.1; done
 	fi
+	sleep "$SETTLE"
 	s=$(workload "$2")
 	echo "overhead,$KERNEL,$1,$2,$3,$s"
 	[ -n "$lp" ] && { kill -INT $lp; wait $lp; }

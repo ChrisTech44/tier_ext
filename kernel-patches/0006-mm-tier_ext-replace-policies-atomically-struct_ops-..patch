@@ -1,7 +1,7 @@
 From ec8bbd39ecbf8cbbf7f73791ddae9760ff48ec2e Mon Sep 17 00:00:00 2001
 From: Christian Franklin <cfranklin4474@gmail.com>
 Date: Tue, 29 Sep 2026 19:28:10 -0400
-Subject: [PATCH 6/6] mm/tier_ext: replace policies atomically (struct_ops
+Subject: [PATCH 6/7] mm/tier_ext: replace policies atomically (struct_ops
  .update)
 
 Implement tier_ext_ops .update, so BPF_LINK_UPDATE swaps an attached

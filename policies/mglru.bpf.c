@@ -503,6 +503,15 @@ TIER_EXT_EVENT(folio_added)
 	n->meta = refs;
 	n->flags = (ws ? F_WS : 0) | F_OWN;
 	seq = folio_seq(lv, type, ctx->folio_flags, refs, ws);
+	/*
+	 * evict_folios(): "don't add rejected folios to the oldest
+	 * generation" - a victim the kernel could not reclaim now (locked
+	 * for read-ahead I/O, under writeback) would otherwise be nominated
+	 * again right away. The kernel marks it active; so do we.
+	 */
+	if (returned && seq == lv->x.min_seq[type & 1])
+		seq = folio_seq(lv, type, ctx->folio_flags | TIER_EXT_F_ACTIVE,
+				refs, ws);
 	te_push_head(lv, LIST(type, seq), ctx->pfn, n);
 unlock:
 	te_unlock(lv);

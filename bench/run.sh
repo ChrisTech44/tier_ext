@@ -33,5 +33,6 @@ $SCP "$ROOT"/policies/build/tier_ext_load "$ROOT"/policies/build/*.bpf.o \
 $SSH 'sudo bash /tmp/b/setup.sh mount > /dev/null'
 mkdir -p "$ROOT/bench/results"
 out=$ROOT/bench/results/$NAME.csv
-$SSH "sudo bash /tmp/b/$BENCH.sh $*" | tee -a "$out" | grep -v '^bench,' || true
+# quote the arguments for the remote shell ("-w 'a b'" must stay one word)
+$SSH "sudo bash /tmp/b/$BENCH.sh $(printf '%q ' "$@")" | tee -a "$out" | grep -v '^bench,' || true
 $SSH 'sudo dmesg | grep -E "WARNING|BUG|Oops|RCU stall|soft lockup" | head -5' || true

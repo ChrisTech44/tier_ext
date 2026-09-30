@@ -42,6 +42,14 @@ policy's own counters.
 | `lfu` | Frequency-based protection keeps a hot file resident while a larger file streams through the same cgroup |
 | `classic` | With MGLRU off: the classic scanner calls the policy (never the MGLRU one), and the swappiness, protect and lfu effects hold, including value=200 |
 | `stress` | 160 attach/detach cycles of five different policies on two cgroups, while one cgroup thrashes anon (stress-ng) and the other thrashes page cache |
+| `mru` | Victim nomination: with `mru`, a 600 MB file read once in a 200 MB cgroup keeps its *first* third in memory (the default keeps the last third); every nomination valid |
+| `garbage` | A hostile `pick_victims` (random, low and swept pfns): every nomination accounted for, ≥99% rejected as invalid/foreign, another cgroup's page cache untouched, the cgroup still held at its limit |
+| `engines` | The BPF `lru` and `mglru` engines, on the MGLRU *and* the classic kernel engine: an anon workload 1.6× the cgroup completes with anon swapped out, >10,000 victims isolated, invalid nominations <0.1%; `mglru` protects a hot file from a stream (≥90%) and uses page table aging |
+| `ports` | cache_ext's `fifo`, `s3fifo`, `sampling`, `lhd`: valid nominations; FIFO keeps the newest data and not the hot file; S3-FIFO keeps the hot file through a scan with no refaults and pgscan < 1.2 × pgsteal |
+| `lfu_mmap` | `folio_referenced`: with `lfu` asking for aging on demand, MGLRU's page table walks report an mmap'd hot file's accesses to the policy |
+| `events` | `folio_removed` when a cached file is deleted; `folio_migrated` for `migratepages` to node 1; migrated folios then reclaimed as victims on node 1's lruvec with no invalid nominations |
+| `update` | `BPF_LINK_UPDATE` replaces `lru` with `mglru` in place: one policy listed throughout, the new one reclaims, nothing left after exit |
+| `engine_stress` | 128 attach/detach cycles of `mglru`, `lru`, `mru`, `garbage`, `fifo`, `s3fifo`, `sampling`, `lhd` on two cgroups under anon and page cache pressure |
 | kernel log | No WARNING/BUG/Oops/RCU stall/soft lockup/hung task during the whole run (kernel built with `DEBUG_VM`) |
 
 ## Results
