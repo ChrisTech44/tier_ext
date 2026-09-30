@@ -269,3 +269,36 @@ per-folio BPF work on a workload of ~96,000 small files, and the sampling
 policies (LHD, LFU) additionally score unread read-ahead lowest. (Refault
 counts are the kernel's shadow-entry statistics, which are not comparable
 across engine policies: the kernel's generations do not advance under them.)
+
+### YCSB on LevelDB (cache_ext's Figure 4, scaled down)
+
+`bench/run.sh tier_ext ycsb ycsb -e y -i 2 -w "c b a f"`: cache_ext's My-YCSB
+driving its LevelDB fork, 20M records (4.1 GB on disk) in a cgroup limited
+to 1 GiB, 4 client threads, zipfian 0.99, 20 s warm-up + 60 s measured, the
+database reset before every run, MGLRU kernel. Throughput in kops/s, mean of
+2 runs (± sd):
+
+| Policy | C (100% read) | B (95% read) | A (50% update) | F (50% RMW) |
+|---|---|---|---|---|
+| kernel default | 115.3 ± 9.5 | 90.4 ± 7.4 | 140.6 ± 0.7 | 143.1 ± 1.0 |
+| `lru` (BPF) | 117.0 ± 2.5 | 93.3 ± 3.0 | **146.8 ± 0.6** | **148.9 ± 5.1** |
+| `s3fifo` | 118.4 ± 3.5 | 89.2 ± 7.5 | 136.9 ± 0.1 | 140.9 ± 0.6 |
+| `mglru` (BPF) | 111.8 ± 0.3 | 81.7 ± 15.1 | 140.3 ± 2.0 | 141.5 ± 0.2 |
+| `fifo` | 107.3 ± 0.5 | 94.0 ± 2.8 | 141.0 ± 1.5 | 145.1 ± 1.9 |
+| `lhd` | 101.9 ± 2.1 | 84.1 ± 2.5 | 129.7 ± 0.1 | 131.3 ± 1.9 |
+| `sampling` | 95.3 ± 1.0 | 80.8 ± 1.3 | 131.2 ± 2.4 | 133.3 ± 6.7 |
+
+Read p99 latencies follow the same order (153–175 µs for the default, up to
+~285 µs for the sampling policies on C). Full numbers: `bench/results/ycsb.csv`.
+
+At this scale the engines are **competitive, not better**: every engine is
+within about ±5% of the kernel's MGLRU, which is also roughly the run-to-run
+spread; the BPF `lru` is marginally ahead on the update-heavy workloads
+(+4%). The sampling policies (LHD, LFU) are 7–17% behind, from their per-
+eviction sampling work. cache_ext reported gains for LHD and S3-FIFO on
+YCSB, but with a database of hundreds of GiB, cgroups of several GiB, and
+real NVMe latency; here the working set is small, I/O is served from the
+host's page cache, and the per-folio BPF cost weighs more than the hit
+ratio. What these runs do show is that complete reclaim algorithms written
+in BPF run a real database at the speed of the kernel's own, per cgroup,
+with every nomination validated.

@@ -1,7 +1,7 @@
 # tier_ext kernel patches
 
 The complete tier_ext kernel change, as seven patches against **Linux 7.3-rc5**
-(unmodified). Together they touch 10 files: 2,103 lines added, 8 removed.
+(unmodified). Together they touch 10 files: 2,106 lines added, 8 removed.
 
 | Patch | What it does |
 |---|---|
