@@ -153,9 +153,10 @@ kernel. They are recorded because each taught something about the interface:
 
 ## Results (phase 2: victim nomination and engines)
 
-**Test suite.** The full suite (now 120 checks) passes on the final code
-with both zram (120/120) and a disk swap partition (120/120), with a clean
-kernel log (`DEBUG_VM`). One threshold was lowered during phase 2: `lfu` on
+**Test suite.** The full suite (now 120 checks) on the final kernel and
+policies: 120/120 with a disk swap partition; with zram 119/120, the one
+failure being the `lfu`-on-classic residency check at its old 75% threshold
+(68% that run). Kernel log clean in both (`DEBUG_VM`). One threshold was lowered during phase 2: `lfu` on
 the classic engine keeps between 52% and 100% of the hot file from run to
 run (phase 1 recorded 82% and 92%; this phase 52, 68, 100, 100, 100); the
 check is now "≥ 50%" instead of "≥ 75%". Without the policy the classic LRU
