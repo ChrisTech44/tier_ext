@@ -114,7 +114,7 @@ in a 256 MB cgroup that calls `folio_mark_accessed` and reclaim constantly):
 The differences are within the run-to-run spread (±5%). This is a coarse
 test; a careful micro-benchmark against an unmodified kernel is future work.
 
-## Swap on a real disk
+## Swap on a real disk (phase 1)
 
 The full suite also passes (**56 of 56**) with `SWAP=partition`, i.e. swapping
 to a partition on a virtual disk instead of zram. The policy guarantees are

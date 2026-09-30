@@ -26,8 +26,8 @@ cgroup (`cgroup_id`) and a set of NUMA nodes (`node_mask`). When it is attached,
 the kernel stores a pointer to it in each selected lruvec. From then on, when
 reclaim works on one of those lruvecs it asks the policy at four decision
 points (skip this lruvec? which anon/file balance? keep or evict this folio
-while scanning? keep, evict, demote this folio now?) and tells it about three
-events (folio added, accessed, evicted). Every question has a "default" answer,
+while scanning? keep, evict, demote this folio now?) and tells it about folio
+events (added, accessed, evicted, removed, migrated, and page table accesses). Every question has a "default" answer,
 which means "do exactly what the kernel would have done", and every lruvec
 without a policy is untouched. The kernel ignores "keep" and "skip" answers once
 reclaim becomes desperate (priority 0), so a policy can shape reclaim but can
