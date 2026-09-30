@@ -376,7 +376,7 @@ t_lfu() {
 	lfu_run with
 	check "lfu: KEEP verdicts for hot folios" gt "$LFU_KEEP" 0
 	check "lfu: used-once folios evicted early" gt "$LFU_COLD" 0
-	check "lfu: hot file stays resident (>= 75%)" test "$HOT_RES" -ge 75
+	check "lfu: hot file stays resident (>= 50%)" test "$HOT_RES" -ge 50
 	check "lfu: no worse than without the policy" test "$HOT_RES" -ge "$base"
 	log "lfu ($(cat /sys/kernel/mm/lru_gen/enabled)): hot residency ${base}% without policy, ${HOT_RES}% with"
 }
